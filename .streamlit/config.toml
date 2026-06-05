@@ -1,0 +1,9 @@
+[server]
+# Tunnel-friendly settings so the app loads through VSCode dev tunnels / ngrok.
+# XSRF protection breaks the websocket handshake behind a reverse-proxy tunnel,
+# which shows up as a page stuck on "Please wait..." — disabling it fixes that.
+enableCORS = false
+enableXsrfProtection = false
+headless = true
+address = "0.0.0.0"
+port = 8501

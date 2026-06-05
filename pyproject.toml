@@ -1,0 +1,24 @@
+[project]
+name = "swingdesk"
+version = "0.1.0"
+description = "Local swing-trading signal app for Indian equities"
+requires-python = ">=3.11"
+dependencies = [
+    "yfinance>=0.2.40",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pandas-ta-classic>=0.1.0",
+    "feedparser>=6.0",
+    "requests>=2.32",
+    "streamlit>=1.36",
+    "plotly>=5.22",
+    "apscheduler>=3.10",
+    "python-dotenv>=1.0",
+    "sqlalchemy>=2.0",
+    "rich>=13.7",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+]
+
+[tool.setuptools.packages.find]
+include = ["swingdesk*"]
