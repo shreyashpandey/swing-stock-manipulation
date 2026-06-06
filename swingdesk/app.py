@@ -39,12 +39,18 @@ from swingdesk.analyze.technicals import (
 )
 from swingdesk.backtest import engine as bt_engine
 from swingdesk.backtest import metrics as bt_metrics
-from swingdesk.config import ACCOUNT_CAPITAL, DEFAULT_WATCHLIST
+from swingdesk.config import (
+    ACCOUNT_CAPITAL,
+    DEFAULT_WATCHLIST,
+    MAX_OPEN_POSITIONS,
+    RISK_PER_TRADE_PCT,
+)
 from swingdesk.ingest import fundamentals as fundamentals_ingest
 from swingdesk.ingest import macro as macro_ingest
 from swingdesk.ingest import news_rss, prices
 from swingdesk.notify import telegram
 from swingdesk.backtest import optimizer as opt
+from swingdesk.portfolio import allocate as allocate_mod
 from swingdesk.portfolio import holdings as holdings_mod
 from swingdesk.portfolio import journal as pj
 from swingdesk.portfolio import positions as portfolio
@@ -83,7 +89,10 @@ with st.sidebar:
     st.header("Actions")
     if st.button("Fetch prices", width="stretch"):
         with st.spinner("Downloading OHLCV..."):
-            res = prices.ingest(get_watchlist(), period="2y")
+            # Watchlist + holdings (+ small caps) so your portfolio always has
+            # chartable price data, not just the curated watchlist.
+            res = prices.ingest(combined_universe(include_smallcaps=True),
+                                period="2y")
         st.success(f"prices: {sum(1 for v in res.values() if v > 0)}/{len(res)} ok")
 
     if st.button("Fetch news", width="stretch"):
@@ -128,11 +137,12 @@ with st.sidebar:
         st.rerun()
 
 
-(tab_holdings, tab_discover, tab_smallcaps, tab_signals, tab_chart, tab_news,
- tab_backtest, tab_optimize, tab_portfolio, tab_reconcile, tab_fundamentals,
- tab_data) = st.tabs(
-    ["My Holdings", "Discover", "Small Caps", "Signals", "Chart", "News",
-     "Backtest", "Optimize", "Portfolio", "Reconcile", "Fundamentals", "Raw data"]
+(tab_holdings, tab_invest, tab_discover, tab_smallcaps, tab_signals, tab_chart,
+ tab_news, tab_backtest, tab_optimize, tab_portfolio, tab_reconcile,
+ tab_fundamentals, tab_data) = st.tabs(
+    ["My Holdings", "💸 Invest", "Discover", "Small Caps", "Signals", "Chart",
+     "News", "Backtest", "Optimize", "Portfolio", "Reconcile", "Fundamentals",
+     "Raw data"]
 )
 
 # --- Discover tab ---------------------------------------------------------------
@@ -247,6 +257,127 @@ with tab_discover:
     else:
         st.info("Click **Scan discovery universe** above to find new ideas. "
                 "Make sure you've run `cli prices` and `cli fundamentals` first.")
+
+
+# --- Invest tab -----------------------------------------------------------------
+with tab_invest:
+    st.subheader("💸 Invest fresh money — where & how much")
+    st.caption(
+        "Tell me how much you want to deploy. I rank the best ideas from the "
+        "discovery universe, then split your amount across them — conviction- "
+        "weighted, capped per stock, and floored to whole shares — with an "
+        "entry, stop and target for each. Rule-based and fully transparent."
+    )
+
+    ic1, ic2, ic3 = st.columns([1.3, 1, 1])
+    with ic1:
+        invest_amt = st.number_input(
+            "Amount to invest (₹)", min_value=1000.0, step=5000.0,
+            value=float(ACCOUNT_CAPITAL),
+            help="Total fresh capital you want to put to work right now.",
+        )
+    with ic2:
+        n_positions = st.slider("Max stocks", 2, 15, min(MAX_OPEN_POSITIONS, 10),
+                                help="Diversify across at most this many names.")
+        min_conv = st.select_slider(
+            "Min conviction", options=["low", "medium", "high"], value="medium",
+            help="Only allocate to ideas at or above this conviction band.",
+        )
+    with ic3:
+        max_w = st.slider("Max per stock (%)", 10, 50, 25,
+                          help="No single position exceeds this share of the amount.") / 100.0
+        st.write("")
+        run_alloc = st.button("Build my plan", type="primary", width="stretch")
+
+    # Reuse a prior discovery scan if present; otherwise scan on demand.
+    opps_inv = st.session_state.get("last_discovery", [])
+    if run_alloc:
+        if not opps_inv:
+            with st.spinner("Ranking the discovery universe..."):
+                opps_inv = discovery.scan()
+            st.session_state["last_discovery"] = opps_inv
+        with st.spinner("Sizing positions..."):
+            plan = allocate_mod.allocate(
+                invest_amt, opps_inv, max_positions=n_positions,
+                max_weight=max_w, min_conviction=min_conv,
+            )
+        st.session_state["last_alloc"] = plan
+
+    plan = st.session_state.get("last_alloc")
+    if not plan:
+        st.info("Set your amount and click **Build my plan**. "
+                "(Tip: run **Scan discovery universe** in the Discover tab first "
+                "for the freshest rankings.)")
+    elif not plan.allocations:
+        for n in plan.notes:
+            st.warning(n)
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Amount", f"₹{plan.amount:,.0f}")
+        m2.metric("Deploying", f"₹{plan.deployed:,.0f}")
+        m3.metric("Cash left", f"₹{plan.leftover:,.0f}")
+        m4.metric("Stocks", plan.n_positions)
+
+        conv_badge = {"high": "🟢 HIGH", "medium": "🟡 MED", "low": "⚪ low"}
+        alloc_rows = []
+        for al in plan.allocations:
+            alloc_rows.append({
+                "Conv": conv_badge.get(al.conviction, "⚪"),
+                "Ticker": al.ticker,
+                "Company": al.company,
+                "Buy shares": al.shares,
+                "Invest ₹": f"₹{al.rupees:,.0f}",
+                "Weight": f"{al.weight_pct:.1f}%",
+                "Price": f"₹{al.price:,.1f}",
+                "Entry ≤": f"₹{al.entry:,.1f}" if al.entry else "—",
+                "Stop": f"₹{al.stoploss:,.1f}" if al.stoploss else "—",
+                "Target": f"₹{al.target:,.1f}" if al.target else "—",
+                "R:R": al.rr or "—",
+                "₹ at risk": f"₹{al.risk_rupees:,.0f}" if al.risk_rupees else "—",
+                "Setup": al.setup or "—",
+            })
+        st.dataframe(pd.DataFrame(alloc_rows), width="stretch", hide_index=True)
+
+        for n in plan.notes:
+            st.caption("• " + n)
+
+        # Pie of the suggested split
+        try:
+            pie = go.Figure(go.Pie(
+                labels=[al.ticker for al in plan.allocations] +
+                       (["Cash"] if plan.leftover > 0 else []),
+                values=[al.rupees for al in plan.allocations] +
+                       ([plan.leftover] if plan.leftover > 0 else []),
+                hole=0.45, textinfo="label+percent",
+            ))
+            pie.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
+                              title="Suggested allocation")
+            st.plotly_chart(pie, width="stretch")
+        except Exception:
+            pass
+
+        # Per-name reasons
+        with st.expander("Why these names?"):
+            for al in plan.allocations:
+                st.markdown(f"**{al.ticker} · {al.company}** — "
+                            f"{' · '.join(al.reasons) if al.reasons else 'ranked by composite score'}")
+
+        st.warning(
+            "⚠ Suggestions, not advice. Entry ≤ means try to buy at or below "
+            "that level; stops/targets are ATR-based. Re-scan and re-plan as "
+            "prices move. Past patterns don't guarantee future returns."
+        )
+
+        with st.expander("📖 How the split is decided"):
+            st.markdown(glossary.VERDICT_METHODOLOGY)
+            st.markdown(
+                "**Sizing rules.** Each idea's weight = conviction band "
+                "(high×3 / med×2 / low×1) × composite score, normalised, then "
+                f"capped at the per-stock limit you set. Top {n_positions} names "
+                "by rank are kept (your *Max stocks*), each floored to whole "
+                "shares; the remainder stays as cash. Risk per name = "
+                "(entry − stop) × shares."
+            )
 
 
 # --- Small Caps tab -------------------------------------------------------------
@@ -1212,6 +1343,46 @@ with tab_holdings:
     if df_h.empty:
         st.info("Upload your Groww holdings CSV above to get started.")
     else:
+        # --- Data-health check: flag holdings with no price data (bad symbols
+        # from the broker export, or simply not fetched yet).
+        held = list(df_h["ticker"])
+        no_price = [t for t in held if load_prices(t, days=30).empty]
+        if no_price:
+            st.warning(
+                f"⚠ **{len(no_price)} holding(s) have no price data** — their "
+                "charts will be blank and the action plan can't size them: "
+                f"{', '.join(no_price)}.\n\n"
+                "Usually the broker export wrote a long company name instead of "
+                "the NSE symbol. Click below to auto-correct known symbols and "
+                "pull their prices."
+            )
+            hc1, hc2 = st.columns([1, 3])
+            with hc1:
+                if st.button("🔧 Fix tickers & refetch", type="primary",
+                             width="stretch"):
+                    with st.spinner("Correcting symbols + downloading prices..."):
+                        remap = holdings_mod.remap_existing_tickers()
+                        fixed_universe = holdings_tickers()
+                        res = prices.ingest(fixed_universe, period="2y")
+                        fundamentals_ingest.ingest(fixed_universe, workers=5)
+                    if remap["changed"]:
+                        st.success(f"Corrected {len(remap['changed'])} symbols: " +
+                                   ", ".join(f"{o}→{n}" for o, n in remap["changed"][:10]) +
+                                   ("…" if len(remap["changed"]) > 10 else ""))
+                    ok = sum(1 for v in res.values() if v > 0)
+                    st.success(f"Fetched prices for {ok}/{len(res)} tickers.")
+                    if remap["untradable"]:
+                        st.info("No equity series available (gold bonds / some "
+                                "ETFs) — remove or chart manually: " +
+                                ", ".join(remap["untradable"]))
+                    st.rerun()
+            with hc2:
+                st.caption(
+                    "Known instruments without a yfinance equity series "
+                    "(Sovereign Gold Bonds, some silver/gold ETFs) can't be "
+                    "charted and will be skipped."
+                )
+
         ai_on = st.toggle("Include AI thesis (Claude analyzes each holding)",
                           value=False,
                           help="Uses Anthropic API. ~₹0.01 per holding analyzed.")
@@ -1265,7 +1436,38 @@ with tab_holdings:
             st.warning(f"⚠ Concentrated sectors (>40% of portfolio): "
                        f"{', '.join(summary['concentrated_sectors'])}")
 
-        # --- Per-holding detail
+        # --- Action plan in NUMBERS: exactly how many shares / ₹ to trade
+        st.markdown("### 📋 Action plan — what to do, in numbers")
+        st.caption(
+            "Concrete trade for each holding. SELL/REDUCE numbers are a fraction "
+            "of your current quantity; BUY MORE is risk-sized to ~"
+            f"{int(RISK_PER_TRADE_PCT)}% of the book against the hard stop and "
+            "capped at 25% position weight."
+        )
+        plans = {a.ticker: allocate_mod.action_plan(a, portfolio_value=total_value)
+                 for a in results}
+        plan_rows = []
+        for a in results:
+            p = plans[a.ticker]
+            plan_rows.append({
+                "Action": p.action,
+                "Ticker": a.ticker,
+                "Hold qty": int(a.qty),
+                "Trade qty": p.shares if p.shares else "—",
+                "Trade ₹": f"₹{p.rupees:,.0f}" if p.shares else "—",
+                "What to do": p.note,
+            })
+        plan_df = pd.DataFrame(plan_rows)
+        sell_total = sum(plans[a.ticker].rupees for a in results
+                         if plans[a.ticker].action in ("SELL", "REDUCE"))
+        buy_total = sum(plans[a.ticker].rupees for a in results
+                        if plans[a.ticker].action == "BUY MORE")
+        pc1, pc2 = st.columns(2)
+        pc1.metric("Cash freed up if you act on SELL/REDUCE", f"₹{sell_total:,.0f}")
+        pc2.metric("Cash needed for BUY MORE top-ups", f"₹{buy_total:,.0f}")
+        st.dataframe(plan_df, width="stretch", hide_index=True)
+
+        # --- Per-holding detail (the full lens breakdown behind each call)
         st.markdown("### Per-holding analysis")
         rows = []
         for a in results:

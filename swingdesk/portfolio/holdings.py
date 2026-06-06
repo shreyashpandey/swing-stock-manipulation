@@ -209,6 +209,60 @@ NAME_TO_TICKER = {
 }
 
 
+# Direct corrections for broker symbols that resolve to the WRONG / no ticker.
+# Groww exports sometimes dump a concatenated long name into the symbol column
+# (e.g. "COALINDIALTD", "BANKOFBARODA") which neither looks like a ticker nor
+# matches the name map cleanly. Key = the raw uppercased symbol as Groww emits
+# it (after -EQ etc. stripping); value = correct NSE ticker, or None if the
+# instrument has no tradable yfinance equity series (SGBs, some ETFs).
+# All non-None targets verified against yfinance.
+TICKER_CORRECTIONS: dict[str, str | None] = {
+    "ADANIPORT&SEZLTD": "ADANIPORTS.NS",
+    "ADANIPOWERLTD": "ADANIPOWER.NS",
+    "BAJAJHINDUSTHANSUGARLT": "BAJAJHIND.NS",
+    "BANKOFBARODA": "BANKBARODA.NS",
+    "CENTRALDEPOSER(I)LTD": "CDSL.NS",
+    "COALINDIALTD": "COALINDIA.NS",
+    "ETERNALLIMITED": "ETERNAL.NS",          # ex-Zomato, renamed 2025
+    "FEDERALBANKLTD": "FEDERALBNK.NS",
+    "GTLINFRA.LTD": "GTLINFRA.NS",
+    "INDIANRAILWAYFINCORPL": "IRFC.NS",
+    "INDIANRENEWABLEENERGY": "IREDA.NS",
+    "MAHINDRALIFESPACEDEVLTD": "MAHLIFE.NS",
+    "MOSCHIPTECHNOLOGIESLTD": "MOSCHIP.NS",
+    "MSTCLIMITED": "MSTCLTD.NS",
+    "NHPCLTD": "NHPC.NS",
+    "OLAELECTRICMOBILITYLTD": "OLAELEC.NS",
+    "ONEMOBIKWIKSYSTEMSLTD": "MOBIKWIK.NS",
+    "ORIENTGREENPOWERCOLTD": "GREENPOWER.NS",
+    "POWERFINCORPLTD.": "PFC.NS",
+    "POWERFINCORPLTD": "PFC.NS",
+    "SHREERENUKASUGARSLTD": "RENUKA.NS",
+    "SHRIRAMPIST.&RINGLTD": "SHRIPISTON.NS",
+    "SJVNLTD": "SJVN.NS",
+    # Tata Motors demerged (2025): old TATAMOTORS.NS no longer trades. Map to
+    # the passenger-vehicle successor that retail holders track. (You may also
+    # separately hold the commercial-vehicle entity — add it manually if so.)
+    "TATAMOTORS": "TMPV.NS",
+    "TATAAML-TATSILV": None,                 # Tata Silver ETF — no clean series
+    "2.50%GOLDBONDS2031SR-III": None,        # Sovereign Gold Bond — no equity data
+    "AVENUESAILIMITED": None,                # unresolved — correct manually
+}
+
+
+def _apply_correction(sym: str) -> str | None | bool:
+    """If `sym` (raw, uppercased, suffix-stripped) is a known-bad broker symbol,
+    return its correction. Returns False when there's no correction entry so the
+    caller can fall through to the normal resolver."""
+    key = sym.upper().strip()
+    if key in TICKER_CORRECTIONS:
+        return TICKER_CORRECTIONS[key]          # str ticker, or None (untradable)
+    # Also try the .NS-stripped form
+    if key.endswith(".NS") and key[:-3] in TICKER_CORRECTIONS:
+        return TICKER_CORRECTIONS[key[:-3]]
+    return False
+
+
 def _resolve_from_name(name: str) -> str | None:
     """Try to map a company name to its NSE ticker. Returns None if no match.
 
@@ -218,9 +272,12 @@ def _resolve_from_name(name: str) -> str | None:
       3. "RELIANCE INDUSTRIES LTD" — uppercase with spaces
     """
     lc = name.lower().strip()
-    # Strip common suffixes (with or without leading space)
+    # Strip common *trailing* suffixes (with or without leading space).
+    # NOTE: "india" is deliberately NOT here — it wrongly truncates names like
+    # "coalindia" → "coal". Country/qualifier words are handled by substring
+    # matching against the name map instead.
     suffixes = ["limited", "ltd.", "ltd", "corporation", "corp.", "corp",
-                "industries", "india", "inc.", "inc", "company"]
+                "industries", "inc.", "inc", "company"]
     # Try suffix removal with both " suffix" and "suffix" (concatenated)
     changed = True
     while changed:
@@ -257,9 +314,21 @@ def _normalize_symbol(sym: str) -> str:
       3. Anything else                               → "<UPPERCASED>.NS" (best-effort)
     """
     s_raw = str(sym).strip()
+    # Highest priority: an explicit correction for a known-bad broker symbol.
+    corrected = _apply_correction(s_raw)
+    if corrected is not False:
+        # str → use the corrected ticker; None → untradable instrument (SGB,
+        # some ETFs): keep the original symbol unchanged so it stays visible,
+        # flagged by the data-health check, and the remap stays idempotent.
+        return corrected if corrected else s_raw
+    upper_check = s_raw.upper()
+    # Already carries an NSE/BSE suffix and survived the correction check above →
+    # it's a finished ticker. Return as-is (idempotent; avoids re-appending .NS
+    # to longer symbols like ADANIPOWER.NS that fail the length heuristic below).
+    if upper_check.endswith(".NS") or upper_check.endswith(".BO"):
+        return upper_check
     # Looks like a real ticker already? Real NSE tickers are short (≤12) and
     # don't end in common suffix words like "LIMITED" / "LTD" / "INDUSTRIES".
-    upper_check = s_raw.upper()
     looks_like_ticker = (
         " " not in s_raw
         and len(s_raw) <= 12
@@ -599,6 +668,11 @@ def analyze_one(ticker: str, qty: float, avg_price: float,
         mfi = float(last["mfi14"]) if pd.notna(last.get("mfi14")) else None
         buy_pressure = float(last["buy_pressure_20"]) if pd.notna(last.get("buy_pressure_20")) else None
 
+    # Backfill a live price from the latest bar when the broker export omitted
+    # one (Groww frequently does) — sizing, P&L and weight all need it.
+    if last_price is None and not df.empty:
+        last_price = float(df.iloc[-1]["close"])
+
     # Sentiment — last 7 days
     sent_df = recent_sentiment_for_ticker(ticker, days=7)
     bull = bear = 0
@@ -685,6 +759,41 @@ def analyze_one(ticker: str, qty: float, avg_price: float,
             a.ai_catalyst = t.catalyst_to_watch
 
     return a
+
+
+def remap_existing_tickers() -> dict:
+    """Re-run ticker normalisation (including TICKER_CORRECTIONS) over the
+    holdings already saved in the DB and re-save them with corrected symbols.
+
+    Lets a user fix a bad import without re-uploading the file. Returns
+    {"changed": [(old, new), ...], "untradable": [tickers with no equity data]}.
+    """
+    from swingdesk.storage import load_holdings, replace_holdings
+
+    df = load_holdings()
+    if df.empty:
+        return {"changed": [], "untradable": []}
+
+    keep = ["ticker", "qty", "avg_price", "last_price", "invested",
+            "current_value", "pnl", "pnl_pct", "source"]
+    changed: list[tuple[str, str]] = []
+    untradable: list[str] = []
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        old = r["ticker"]
+        new = _normalize_symbol(old)
+        if _apply_correction(old) is None:        # explicit "no equity series"
+            untradable.append(old)
+        if new != old:
+            changed.append((old, new))
+        row = {}
+        for c in keep:
+            v = r.get(c)
+            row[c] = None if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+        row["ticker"] = new
+        rows.append(row)
+    replace_holdings(rows)
+    return {"changed": changed, "untradable": untradable}
 
 
 def analyze_portfolio(holdings_df: pd.DataFrame,
