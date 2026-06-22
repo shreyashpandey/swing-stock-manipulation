@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pandas as pd
-import yfinance as yf
 from rich.console import Console
 
 from swingdesk.storage import upsert_earnings
@@ -20,6 +19,7 @@ console = Console()
 
 def fetch_one(ticker: str) -> tuple[str | None, str | None]:
     """Return (next_earnings_iso, last_earnings_iso). Either may be None."""
+    import yfinance as yf  # lazy: keep heavy import off app startup
     try:
         t = yf.Ticker(ticker)
         df = t.earnings_dates

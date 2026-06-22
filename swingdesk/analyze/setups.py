@@ -144,14 +144,199 @@ def detect_volume_thrust(df: pd.DataFrame, ticker: str) -> dict | None:
     }
 
 
-DETECTORS = [detect_breakout, detect_pullback_to_ema, detect_ma_cross, detect_volume_thrust]
+def detect_macd_cross(df: pd.DataFrame, ticker: str) -> dict | None:
+    """MACD line crosses above its signal line while above the 50-EMA — a clean,
+    widely-followed momentum buy trigger."""
+    if len(df) < 60:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    cols = ("macd", "macd_signal", "ema50", "atr14")
+    if any(pd.isna(last.get(c)) for c in cols) or pd.isna(prev.get("macd")):
+        return None
+    cross_up = prev["macd"] <= prev["macd_signal"] and last["macd"] > last["macd_signal"]
+    trend_ok = last["close"] > last["ema50"]
+    below_zero = last["macd"] < 0          # cross from below 0 = earlier, stronger
+    if not (cross_up and trend_ok):
+        return None
+    atr = last["atr14"]
+    entry = last["close"]
+    stoploss = entry - 1.5 * atr
+    target = entry + 3.0 * atr
+    rr = (target - entry) / max(entry - stoploss, 1e-6)
+    return {
+        "ticker": ticker, "setup": "macd_cross", "direction": "long",
+        "entry": _round(entry), "stoploss": _round(stoploss), "target": _round(target),
+        "rr": _round(rr, 2), "score": _round(60 + (8 if below_zero else 0), 1),
+        "notes": (f"MACD crossed above signal{' from below zero' if below_zero else ''}; "
+                  "above 50EMA"),
+    }
 
 
-def scan_ticker(ticker: str) -> list[dict]:
+def detect_supertrend_flip(df: pd.DataFrame, ticker: str) -> dict | None:
+    """Supertrend flips from bearish to bullish with the long-term trend intact
+    — an explicit regime-change buy signal; the Supertrend line is the stop."""
+    if len(df) < 60 or "supertrend_dir" not in df.columns:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    if any(pd.isna(last.get(c)) for c in ("supertrend_dir", "supertrend", "ema200", "atr14")):
+        return None
+    flipped_up = float(prev.get("supertrend_dir", 0) or 0) < 0 and float(last["supertrend_dir"]) > 0
+    trend_ok = last["close"] > last["ema200"]
+    if not (flipped_up and trend_ok):
+        return None
+    atr = last["atr14"]
+    entry = last["close"]
+    # Stop just under the supertrend line (its built-in trailing stop), bounded by ATR.
+    stoploss = min(float(last["supertrend"]), entry - 0.5 * atr)
+    target = entry + 3.0 * atr
+    rr = (target - entry) / max(entry - stoploss, 1e-6)
+    if rr <= 0:
+        return None
+    return {
+        "ticker": ticker, "setup": "supertrend_flip", "direction": "long",
+        "entry": _round(entry), "stoploss": _round(stoploss), "target": _round(target),
+        "rr": _round(rr, 2), "score": 62.0,
+        "notes": f"Supertrend flipped bullish at ₹{last['supertrend']:.0f}; above 200EMA",
+    }
+
+
+def detect_bollinger_breakout(df: pd.DataFrame, ticker: str) -> dict | None:
+    """Bollinger 'squeeze' (volatility coil at a 60-day low) resolving with a
+    close above the upper band on expanding volume — a classic expansion buy."""
+    if len(df) < 60:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    cols = ("bb_upper", "bb_width", "bb_width_min60", "vol_avg20", "atr14", "ema50")
+    if any(pd.isna(last.get(c)) for c in cols):
+        return None
+    was_squeezed = prev["bb_width"] <= prev.get("bb_width_min60", prev["bb_width"]) * 1.15
+    breakout = last["close"] > last["bb_upper"]
+    vol_ok = last["volume"] > 1.3 * last["vol_avg20"]
+    trend_ok = last["close"] > last["ema50"]
+    if not (was_squeezed and breakout and vol_ok and trend_ok):
+        return None
+    atr = last["atr14"]
+    entry = last["close"]
+    stoploss = float(last["bb_mid"]) if pd.notna(last.get("bb_mid")) else entry - 1.5 * atr
+    target = entry + 3.0 * atr
+    rr = (target - entry) / max(entry - stoploss, 1e-6)
+    if rr <= 0:
+        return None
+    return {
+        "ticker": ticker, "setup": "bollinger_breakout", "direction": "long",
+        "entry": _round(entry), "stoploss": _round(stoploss), "target": _round(target),
+        "rr": _round(rr, 2), "score": _round(58 + (last["volume"]/last["vol_avg20"] - 1.3) * 8, 1),
+        "notes": (f"squeeze breakout: close above upper band on "
+                  f"{last['volume']/last['vol_avg20']:.1f}x volume"),
+    }
+
+
+def detect_rsi_reversal(df: pd.DataFrame, ticker: str) -> dict | None:
+    """Oversold bounce inside a longer-term uptrend: RSI was < 35 and turns back
+    up above 40 while price holds above the 200-EMA. Buy the dip, not the crash."""
+    if len(df) < 60:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    if any(pd.isna(last.get(c)) for c in ("rsi14", "ema200", "atr14")) or pd.isna(prev.get("rsi14")):
+        return None
+    was_oversold = prev["rsi14"] < 35
+    turning_up = last["rsi14"] > prev["rsi14"] and last["rsi14"] > 40
+    uptrend = last["close"] > last["ema200"]
+    bullish_bar = last["close"] > last["open"]
+    if not (was_oversold and turning_up and uptrend and bullish_bar):
+        return None
+    atr = last["atr14"]
+    entry = last["close"]
+    stoploss = last["low"] - 0.5 * atr
+    target = entry + 2.5 * atr
+    rr = (target - entry) / max(entry - stoploss, 1e-6)
+    if rr <= 0:
+        return None
+    return {
+        "ticker": ticker, "setup": "rsi_reversal", "direction": "long",
+        "entry": _round(entry), "stoploss": _round(stoploss), "target": _round(target),
+        "rr": _round(rr, 2), "score": _round(55 + (last["rsi14"] - 40), 1),
+        "notes": f"oversold bounce (RSI {prev['rsi14']:.0f}→{last['rsi14']:.0f}) above 200EMA",
+    }
+
+
+def detect_golden_cross(df: pd.DataFrame, ticker: str) -> dict | None:
+    """50-EMA crosses above the 200-EMA — the classic long-horizon 'golden cross'
+    that often marks the start of a multi-month positional uptrend."""
+    if len(df) < 210:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    if any(pd.isna(x) for x in (last.get("ema50"), last.get("ema200"),
+                                prev.get("ema50"), prev.get("ema200"), last.get("atr14"))):
+        return None
+    cross = prev["ema50"] <= prev["ema200"] and last["ema50"] > last["ema200"]
+    if not cross:
+        return None
+    atr = last["atr14"]
+    entry = last["close"]
+    stoploss = entry - 2.5 * atr
+    target = entry + 6.0 * atr
+    rr = (target - entry) / max(entry - stoploss, 1e-6)
+    return {
+        "ticker": ticker, "setup": "golden_cross", "direction": "long",
+        "entry": _round(entry), "stoploss": _round(stoploss), "target": _round(target),
+        "rr": _round(rr, 2), "score": 68.0,
+        "notes": "50EMA crossed above 200EMA (golden cross — positional trend start)",
+    }
+
+
+def detect_adx_trend(df: pd.DataFrame, ticker: str) -> dict | None:
+    """Trend-strength entry: ADX rising through 25 with DI+ above DI- and price
+    above the 20-EMA — enter only when the market is genuinely trending up."""
+    if len(df) < 60 or "adx14" not in df.columns:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    cols = ("adx14", "di_plus", "di_minus", "ema20", "atr14")
+    if any(pd.isna(last.get(c)) for c in cols) or pd.isna(prev.get("adx14")):
+        return None
+    strong = last["adx14"] >= 25
+    rising = last["adx14"] > prev["adx14"]
+    bull_dir = last["di_plus"] > last["di_minus"]
+    trend_ok = last["close"] > last["ema20"]
+    if not (strong and rising and bull_dir and trend_ok):
+        return None
+    atr = last["atr14"]
+    entry = last["close"]
+    stoploss = entry - 2.0 * atr
+    target = entry + 4.0 * atr
+    rr = (target - entry) / max(entry - stoploss, 1e-6)
+    return {
+        "ticker": ticker, "setup": "adx_trend", "direction": "long",
+        "entry": _round(entry), "stoploss": _round(stoploss), "target": _round(target),
+        "rr": _round(rr, 2), "score": _round(58 + min(20, last["adx14"] - 25), 1),
+        "notes": f"ADX {last['adx14']:.0f} rising, DI+ > DI−, above 20EMA — trending up",
+    }
+
+
+DETECTORS = [
+    detect_breakout, detect_pullback_to_ema, detect_ma_cross, detect_volume_thrust,
+    detect_macd_cross, detect_supertrend_flip, detect_bollinger_breakout,
+    detect_rsi_reversal, detect_golden_cross, detect_adx_trend,
+]
+
+
+def scan_ticker(ticker: str, require_uptrend: bool = True) -> list[dict]:
+    """Detect setups for one ticker. With require_uptrend (default), no signals
+    are emitted while price is below its 200-day EMA — a counter-trend long is
+    the lowest-quality entry. Backtest evidence (exit_tuner sweep, 2026-06): this
+    trend gate is the single biggest expectancy improver (profit factor
+    0.83→0.95). It does NOT make the setups net-profitable on its own — treat
+    signals as screened ideas, not a mechanical system."""
     df = load_prices(ticker)
     if df.empty:
         return []
     df = add_indicators(df)
+    if require_uptrend:
+        last = df.iloc[-1]
+        e200 = last.get("ema200")
+        # Only gate when EMA200 is computable; too-short history isn't penalised.
+        if e200 is not None and not pd.isna(e200) and last["close"] <= e200:
+            return []
     signals = []
     for fn in DETECTORS:
         try:
@@ -164,12 +349,13 @@ def scan_ticker(ticker: str) -> list[dict]:
 
 
 def scan_all(tickers: list[str], persist: bool = True,
-             universe: str = "main") -> list[dict]:
+             universe: str = "main", require_uptrend: bool = True) -> list[dict]:
     """Scan a list of tickers for setups. `universe` labels persisted signals
-    so the Signals tab can filter (main vs smallcap)."""
+    so the Signals tab can filter (main vs smallcap). `require_uptrend` gates
+    out counter-trend (below-200-EMA) entries."""
     all_signals: list[dict] = []
     for t in tickers:
-        sigs = scan_ticker(t)
+        sigs = scan_ticker(t, require_uptrend=require_uptrend)
         if sigs:
             for s in sigs:
                 s["universe"] = universe

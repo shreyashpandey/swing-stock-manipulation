@@ -31,6 +31,14 @@ FEEDS: list[tuple[str, str]] = [
     ("Moneycontrol-MarketEdge", "https://www.moneycontrol.com/rss/marketedge.xml"),
     ("ET-IPO",                "https://economictimes.indiatimes.com/markets/ipos/fpos/rssfeeds/14655708.cms"),
     ("Moneycontrol-IPO",      "https://www.moneycontrol.com/rss/iponews.xml"),
+    # ---- Added on request (verified live): NDTV Profit, Hindu BusinessLine,
+    # CNBC-TV18, extra Livemint. (LiveSquawk / MarketsMojo / ScoutQuest / BSE
+    # don't publish public RSS; NSE/BSE bulk trades are ingested via nse.py.)
+    ("NDTVProfit",            "https://feeds.feedburner.com/ndtvprofit-latest"),
+    ("HinduBL-Markets",       "https://www.thehindubusinessline.com/markets/feeder/default.rss"),
+    ("HinduBL-Companies",     "https://www.thehindubusinessline.com/companies/feeder/default.rss"),
+    ("CNBCTV18-Stocks",       "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market/stocks.xml"),
+    ("Livemint-Companies",    "https://www.livemint.com/rss/companies"),
     # ---- Global macro that drives Indian markets ----
     # US monetary policy & macro: directly drives USD/INR + Indian IT + FII flows
     ("CNBC-WorldNews",        "https://www.cnbc.com/id/100727362/device/rss/rss.html"),
@@ -249,4 +257,11 @@ def ingest(watchlist: list[str]) -> int:
             console.print(f"  news: {name:>30} -> {len(items):>3} items ({n} new)")
         except Exception as e:
             console.print(f"[red]news fetch failed for {name}: {e}[/red]")
+    # Non-RSS sources (LiveSquawk, MarketsMojo) via HTML scrapers. Lazy import
+    # avoids a circular dependency (news_scrape imports _match_tickers from here).
+    try:
+        from swingdesk.ingest import news_scrape
+        total += news_scrape.ingest(watchlist)
+    except Exception as e:
+        console.print(f"[red]news scrape stage failed: {e}[/red]")
     return total

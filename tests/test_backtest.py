@@ -55,6 +55,21 @@ def test_backtest_ticker_runs(tmp_db):
         assert -5 < t.r_multiple < 10
 
 
+def test_require_uptrend_filters_entries(tmp_db):
+    _seeded_prices("TEST.NS")
+    all_trades = engine.backtest_ticker("TEST.NS", max_hold=20, require_uptrend=False)
+    up_only = engine.backtest_ticker("TEST.NS", max_hold=20, require_uptrend=True)
+    # The trend gate can only remove entries, never add them.
+    assert len(up_only) <= len(all_trades)
+    # Every uptrend-gated entry must have been taken above the 200-EMA.
+    df = engine.add_indicators(engine.load_prices("TEST.NS"))
+    e200 = df["ema200"]
+    for t in up_only:
+        close_at_entry = float(df.loc[t.entry_date, "close"])
+        ema_at_entry = float(e200.loc[t.entry_date])
+        assert close_at_entry > ema_at_entry
+
+
 def test_backtest_universe_aggregates(tmp_db):
     _seeded_prices("A.NS")
     _seeded_prices("B.NS")
@@ -172,6 +187,31 @@ def test_summarize_basic():
     assert abs(a_row["win_rate"] - 0.667) < 0.01
     # avg_r = (2 + -1 + 2) / 3 = 1.0
     assert abs(a_row["avg_r"] - 1.0) < 0.01
+
+
+def test_summarize_net_of_cost():
+    # entry 100, stop 98 -> 1R = ₹2 = 2% of price. A 0.5% round-trip cost is
+    # 0.5/2 = 0.25R per trade. Net avg_r must drop by ~0.25R vs gross.
+    trades = pd.DataFrame([
+        {"setup": "A", "r": 2.0, "entry": 100.0, "stoploss": 98.0,
+         "bars_held": 5, "entry_date": "2024-01-01"},
+        {"setup": "A", "r": -1.0, "entry": 100.0, "stoploss": 98.0,
+         "bars_held": 3, "entry_date": "2024-01-05"},
+    ])
+    gross = metrics.summarize(trades, cost_pct=0.0)
+    net = metrics.summarize(trades, cost_pct=0.5)
+    a_gross = gross[gross["setup"] == "A"].iloc[0]
+    a_net = net[net["setup"] == "A"].iloc[0]
+    assert abs(a_gross["avg_r"] - 0.5) < 1e-6           # (2 + -1)/2
+    assert abs(a_net["avg_cost_r"] - 0.25) < 1e-6       # 0.5% / 2% stop = 0.25R
+    assert abs(a_net["avg_r"] - 0.25) < 1e-6            # 0.5 gross − 0.25 cost
+    assert abs(a_net["gross_avg_r"] - 0.5) < 1e-6       # gross preserved
+    # A marginal gross winner flips to a net loser after costs.
+    # entry 100, stop 96 -> 1R = 4% ; 0.5% cost = 0.125R > 0.1R gross gain.
+    flip = pd.DataFrame([{"setup": "M", "r": 0.1, "entry": 100.0,
+                          "stoploss": 96.0, "bars_held": 2, "entry_date": "2024-01-01"}])
+    fn = metrics.summarize(flip, cost_pct=0.5)
+    assert fn.iloc[0]["avg_r"] < 0                       # 0.1R − 0.125R cost < 0
 
 
 def test_max_consec_losses():

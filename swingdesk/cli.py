@@ -16,10 +16,12 @@ from swingdesk.config import DEFAULT_WATCHLIST
 from swingdesk.ingest import earnings as earnings_ingest
 from swingdesk.ingest import fundamentals as fundamentals_ingest
 from swingdesk.ingest import macro as macro_ingest
+from swingdesk.ingest import nse as nse_ingest
 from swingdesk.ingest import news_rss, prices
 from swingdesk.notify import telegram
 from swingdesk.portfolio import journal as pj
 from swingdesk.portfolio import positions as portfolio
+from swingdesk.portfolio import paper_trader as paper_trader_mod
 from swingdesk.portfolio import holdings as holdings_mod
 from swingdesk.portfolio import import_groww
 from swingdesk.portfolio import reconcile as reconcile_mod
@@ -168,6 +170,31 @@ def cmd_run(args):
         console.print(f"[bold]paper-trade: opened {result['opened']}, "
                       f"skipped {result['skipped']}[/bold]")
         telegram.send_signals(sigs)
+
+
+def cmd_paper_step(args):
+    """Run one step of the execution-cost-aware paper autotrader (loop-friendly)."""
+    cfg = paper_trader_mod.AutoTraderConfig(
+        min_score=args.min_score, algo=args.algo,
+        max_portfolio_heat_pct=args.max_heat, kill_switch_dd_pct=args.kill_dd,
+        flatten_on_kill=args.flatten_on_kill)
+    universe = get_watchlist()
+    rep = paper_trader_mod.step(cfg, universe=universe, refresh=args.refresh)
+    state = "⛔ HALTED" if rep.halted else "🟢 active"
+    console.print(
+        f"[bold]paper-step[/bold] {rep.asof}  {state}  "
+        f"equity ₹{rep.equity:,.0f}  dd {rep.drawdown_pct:.1f}%  "
+        f"heat {rep.portfolio_heat_pct:.1f}%  "
+        f"[green]+{len(rep.entries)} opened[/green] "
+        f"[yellow]{len(rep.exits)} closed[/yellow]  {rep.n_open} open")
+    for e in rep.entries:
+        console.print(f"  [green]open[/green] {e['ticker']:>15} x{e['qty']} "
+                      f"@ ₹{e['fill']} (+{e['slip_bps']:.0f}bps) · {e['setup']}")
+    for x in rep.exits:
+        console.print(f"  [yellow]exit[/yellow] {x['ticker']:>15} {x['exit_reason']} "
+                      f"P&L ₹{x['pnl']}")
+    for n in rep.notes:
+        console.print(f"  [dim]{n}[/dim]")
 
 
 # --- portfolio commands ---------------------------------------------------------
@@ -534,6 +561,16 @@ def cmd_fundamentals(args):
     fundamentals_ingest.ingest(universe)
 
 
+def cmd_nse(args):
+    """Pull NSE delivery % + bulk/block deals for the universe (manipulation section)."""
+    init_db()
+    seed_watchlist_if_empty(DEFAULT_WATCHLIST)
+    universe = combined_universe()
+    console.print(f"[bold]Fetching NSE delivery ({args.days}d) + deals for "
+                  f"{len(universe)} tickers[/bold]")
+    nse_ingest.ingest(universe, days=args.days)
+
+
 def cmd_screen(args):
     """Rank watchlist by fundamental quality. Optionally filter or replace the watchlist."""
     from swingdesk.analyze import quality as quality_mod
@@ -676,6 +713,22 @@ def main(argv: list[str] | None = None) -> int:
                    help="Skip refreshing the earnings calendar (faster)")
     p.set_defaults(func=cmd_run)
 
+    p = sub.add_parser("paper-step",
+                       help="One step of the paper autotrader (exit → enter, exec-cost fills, kill-switch)")
+    p.add_argument("--min-score", type=float, default=60.0,
+                   help="Min signal score to enter (default 60)")
+    p.add_argument("--algo", default="vwap", choices=["vwap", "twap", "pov", "is"],
+                   help="Execution algo used to price entry fills (default vwap)")
+    p.add_argument("--max-heat", type=float, default=6.0,
+                   help="Max portfolio heat %% (total open risk vs capital, default 6)")
+    p.add_argument("--kill-dd", type=float, default=10.0,
+                   help="Halt new entries at this equity drawdown %% (default 10)")
+    p.add_argument("--flatten-on-kill", action="store_true",
+                   help="Close all positions when the kill-switch trips")
+    p.add_argument("--refresh", action="store_true",
+                   help="Re-download fresh prices before evaluating")
+    p.set_defaults(func=cmd_paper_step)
+
     # ---- portfolio commands ----
     p = sub.add_parser("positions", help="List positions (paper by default)")
     p.add_argument("--status", default="all", choices=["all", "open", "closed"])
@@ -775,6 +828,11 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Week 5 commands ----
     p = sub.add_parser("fundamentals", help="Fetch fundamental ratios per ticker (yfinance)")
     p.set_defaults(func=cmd_fundamentals)
+
+    p = sub.add_parser("nse", help="Fetch NSE delivery %% + bulk/block deals (manipulation section)")
+    p.add_argument("--days", type=int, default=20,
+                   help="Trading days of delivery history to backfill (default 20)")
+    p.set_defaults(func=cmd_nse)
 
     p = sub.add_parser("screen", help="Rank watchlist by fundamental quality")
     p.add_argument("--min-score", type=float, default=60.0,

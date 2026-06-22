@@ -158,6 +158,11 @@ def summarize(ticker: str) -> StockSummary | None:
     mfi = float(last["mfi14"]) if pd.notna(last.get("mfi14")) else None
     vol_x = ((float(last["volume"]) / float(last["vol_avg20"]))
              if pd.notna(last.get("vol_avg20")) else None)
+    # Trend-strength (ADX/DI) + Supertrend regime — clear directional reads.
+    adx = float(last["adx14"]) if pd.notna(last.get("adx14")) else None
+    di_plus = float(last["di_plus"]) if pd.notna(last.get("di_plus")) else None
+    di_minus = float(last["di_minus"]) if pd.notna(last.get("di_minus")) else None
+    st_dir = float(last["supertrend_dir"]) if pd.notna(last.get("supertrend_dir")) else None
 
     setup = None
     sigs = scan_ticker(ticker)
@@ -209,6 +214,10 @@ def summarize(ticker: str) -> StockSummary | None:
         s.why_invest.append(f"Up {momentum:+.0f}% over the last 20 sessions — momentum positive")
     if rsi is not None and 45 <= rsi <= 65:
         s.why_invest.append(f"RSI {rsi:.0f} — healthy, room to run before overbought")
+    if st_dir is not None and st_dir > 0:
+        s.why_invest.append("Supertrend bullish — regime favours holding longs")
+    if adx is not None and adx >= 25 and di_plus is not None and di_minus is not None and di_plus > di_minus:
+        s.why_invest.append(f"ADX {adx:.0f} with DI+ > DI− — a strong, powering uptrend")
     # Why-invest bullets — volume / money flow
     if vol_x is not None and vol_x >= 1.5:
         s.why_invest.append(f"Today's volume {vol_x:.1f}× the 20-day average — conviction behind the move")
@@ -237,6 +246,10 @@ def summarize(ticker: str) -> StockSummary | None:
         s.why_avoid.append("Below the 50 EMA — short-term trend weakening")
     if momentum is not None and momentum <= -5:
         s.why_avoid.append(f"Down {momentum:+.0f}% over the last 20 sessions — momentum negative")
+    if st_dir is not None and st_dir < 0:
+        s.why_avoid.append("Supertrend bearish — regime says stay out / protect capital")
+    if adx is not None and adx >= 25 and di_plus is not None and di_minus is not None and di_minus > di_plus:
+        s.why_avoid.append(f"ADX {adx:.0f} with DI− > DI+ — a strong downtrend in force")
     if rsi and rsi > 80:
         s.why_avoid.append(f"Overbought (RSI {rsi:.0f}) — wait for pullback")
     elif rsi is not None and rsi < 30:

@@ -11,6 +11,7 @@ Design notes:
 from __future__ import annotations
 
 import os
+import time
 from typing import Literal
 
 import anthropic
@@ -18,7 +19,7 @@ import pandas as pd
 from pydantic import BaseModel, Field
 from rich.console import Console
 
-from swingdesk.config import CLAUDE_MODEL, SENTIMENT_BATCH_SIZE
+from swingdesk.config import SENTIMENT_BATCH_SIZE, SENTIMENT_MODEL
 from swingdesk.storage import load_unanalyzed_news, update_news_sentiment
 
 console = Console()
@@ -96,7 +97,7 @@ def _analyze_batch(client: anthropic.Anthropic, batch: pd.DataFrame) -> list[dic
     payload = _format_batch(batch)
 
     response = client.messages.parse(
-        model=CLAUDE_MODEL,
+        model=SENTIMENT_MODEL,
         max_tokens=4096,
         # Per-block cache_control on the system prompt — the rubric is stable
         # across all batches, so subsequent calls hit the cache (~0.1x cost).
@@ -131,8 +132,39 @@ def _analyze_batch(client: anthropic.Anthropic, batch: pd.DataFrame) -> list[dic
     return [item.model_dump() for item in response.parsed_output.items]
 
 
-def ingest(max_items: int = 200) -> int:
-    """Analyze up to N unanalyzed news rows. Returns count classified."""
+def _classify_with_retry(client: anthropic.Anthropic, batch,
+                         extra_attempts: int = 2, max_wait_s: float = 25.0) -> list[dict]:
+    """Run one batch, retrying on rate-limit (429) beyond the SDK's own backoff
+    so a busy Haiku quota delays headlines rather than dropping them. Honors the
+    `retry-after` header when present; gives up after `max_wait_s` total."""
+    waited, delay = 0.0, 3.0
+    for attempt in range(extra_attempts + 1):
+        try:
+            return _analyze_batch(client, batch)
+        except anthropic.RateLimitError as e:
+            if attempt >= extra_attempts:
+                raise
+            wait = delay
+            try:
+                wait = float(e.response.headers.get("retry-after") or delay)
+            except Exception:
+                pass
+            if waited + wait > max_wait_s:
+                raise
+            console.print(f"  [dim]sentiment: rate-limited, waiting {wait:.0f}s then retrying…[/dim]")
+            time.sleep(wait)
+            waited += wait
+            delay = min(delay * 2, 12.0)
+    return []  # unreachable, keeps type-checkers happy
+
+
+def ingest(max_items: int = 200, progress=None) -> int:
+    """Analyze up to N unanalyzed news rows. Returns count classified.
+
+    `progress`, if given, is called as ``progress(done, total)`` after each batch
+    so a UI (e.g. the Streamlit button) can show a live bar instead of one long
+    spinner — the run is several sequential API calls and otherwise looks frozen.
+    """
     if not os.getenv("ANTHROPIC_API_KEY"):
         console.print("[yellow]sentiment: ANTHROPIC_API_KEY not set — skipping[/yellow]")
         return 0
@@ -142,25 +174,41 @@ def ingest(max_items: int = 200) -> int:
         console.print("  sentiment: no unanalyzed news")
         return 0
 
-    # Longer timeout + more retries — Opus 4.7 can be slow on batched classification.
-    client = anthropic.Anthropic(timeout=120.0, max_retries=3)
+    # The SDK already retries 429/5xx with backoff; max_retries=5 gives extra
+    # headroom for Haiku's burst limit when we fire many batches in a row.
+    client = anthropic.Anthropic(timeout=60.0, max_retries=5)
     total = 0
     n = SENTIMENT_BATCH_SIZE
+    rows = len(df)
 
-    console.print(f"[bold]Analyzing {len(df)} headlines (batch={n})[/bold]")
-    for start in range(0, len(df), n):
+    def _emit(done: int) -> None:
+        if progress is not None:
+            try:
+                progress(done, rows)
+            except Exception:
+                pass
+
+    console.print(f"[bold]Analyzing {rows} headlines (batch={n}, model={SENTIMENT_MODEL})[/bold]")
+    for start in range(0, rows, n):
+        if start:
+            time.sleep(0.4)             # pace batches so we don't trip the burst limit
         batch = df.iloc[start:start + n]
+        done = min(start + n, rows)
         try:
-            results = _analyze_batch(client, batch)
+            results = _classify_with_retry(client, batch)
         except anthropic.AuthenticationError:
             console.print("[red]sentiment: bad API key — aborting[/red]")
             break
         except anthropic.APIStatusError as e:
-            # 4xx other than auth: log and skip this batch
-            console.print(f"[red]sentiment: API error {e.status_code} on batch — skipping[/red]")
+            # Rate-limit or other 4xx that survived retries: leave these rows
+            # unanalyzed (they'll be picked up next click) rather than marking
+            # them done. Advance the bar so the UI doesn't look stuck.
+            console.print(f"[red]sentiment: API error {e.status_code} on batch — leaving for next run[/red]")
+            _emit(done)
             continue
         except Exception as e:
             console.print(f"[yellow]sentiment: batch failed ({e.__class__.__name__}) — skipping[/yellow]")
+            _emit(done)
             continue
 
         # Drop anything where the model returned an id not in this batch.
@@ -169,6 +217,7 @@ def ingest(max_items: int = 200) -> int:
         update_news_sentiment(clean)
         total += len(clean)
         console.print(f"  sentiment: batch {start // n + 1} -> {len(clean)} classified")
+        _emit(done)
 
     console.print(f"[green]{total} headlines classified[/green]")
     return total

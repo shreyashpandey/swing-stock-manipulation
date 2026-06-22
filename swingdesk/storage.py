@@ -132,6 +132,8 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     sector            TEXT,
     industry          TEXT,
     market_cap        REAL,                       -- in INR (full notional)
+    shares_outstanding REAL,                      -- total shares issued
+    float_shares      REAL,                       -- free-float shares (tradable)
     trailing_pe       REAL,
     forward_pe        REAL,
     price_to_book     REAL,
@@ -171,6 +173,70 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_bt_run ON backtest_trades(run_id);
 CREATE INDEX IF NOT EXISTS idx_bt_setup ON backtest_trades(setup);
+
+CREATE TABLE IF NOT EXISTS delivery (
+    ticker      TEXT NOT NULL,                  -- yfinance-style, e.g. RELIANCE.NS
+    date        TEXT NOT NULL,                  -- ISO yyyy-mm-dd
+    traded_qty  REAL,                           -- total shares traded
+    deliv_qty   REAL,                           -- shares actually delivered
+    deliv_pct   REAL,                           -- delivery as % of traded (0-100)
+    PRIMARY KEY (ticker, date)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_ticker ON delivery(ticker);
+
+CREATE TABLE IF NOT EXISTS deals (
+    deal_type   TEXT NOT NULL,                  -- 'bulk' | 'block'
+    date        TEXT NOT NULL,                  -- ISO yyyy-mm-dd
+    ticker      TEXT NOT NULL,                  -- yfinance-style, e.g. RELIANCE.NS
+    security    TEXT,
+    client      TEXT,
+    side        TEXT,                           -- 'BUY' | 'SELL'
+    qty         REAL,
+    price       REAL,
+    PRIMARY KEY (deal_type, date, ticker, client, side, qty)
+);
+CREATE INDEX IF NOT EXISTS idx_deals_ticker ON deals(ticker);
+
+CREATE TABLE IF NOT EXISTS prices_intraday (
+    ticker      TEXT NOT NULL,                  -- yfinance-style, e.g. RELIANCE.NS
+    interval    TEXT NOT NULL,                  -- '5m' | '15m' | '1h'
+    datetime    TEXT NOT NULL,                  -- ISO timestamp (exchange tz)
+    open        REAL, high REAL, low REAL, close REAL, volume REAL,
+    PRIMARY KEY (ticker, interval, datetime)
+);
+CREATE INDEX IF NOT EXISTS idx_intraday_ticker ON prices_intraday(ticker, interval);
+
+CREATE TABLE IF NOT EXISTS autotrader_log (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof               TEXT NOT NULL,             -- evaluation date (YYYY-MM-DD)
+    equity             REAL,
+    free_cash          REAL,
+    realized_pnl       REAL,
+    unrealized_pnl     REAL,
+    peak_equity        REAL,
+    drawdown_pct       REAL,
+    portfolio_heat_pct REAL,
+    n_open             INTEGER,
+    opened             INTEGER,
+    closed             INTEGER,
+    halted             INTEGER DEFAULT 0,
+    note               TEXT,
+    created_at         TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS plans (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT NOT NULL,
+    planned_amount  REAL NOT NULL,                 -- ₹ you intend to deploy on this name
+    target_price    REAL,                          -- optional desired entry level
+    stop_price      REAL,
+    note            TEXT,
+    status          TEXT DEFAULT 'idea',           -- idea | watching | entered | dropped
+    conviction      REAL,                          -- Decision.conviction snapshot at log time
+    created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_plans_ticker ON plans(ticker);
 """
 
 
@@ -214,6 +280,14 @@ def init_db(db_path: Path | None = None) -> None:
         existing_sig = {r[1] for r in con.execute("PRAGMA table_info(signals)")}
         if "universe" not in existing_sig:
             con.execute("ALTER TABLE signals ADD COLUMN universe TEXT DEFAULT 'main'")
+        # 2d. Migrate `fundamentals` for the size/float columns (manipulation section).
+        existing_fund = {r[1] for r in con.execute("PRAGMA table_info(fundamentals)")}
+        for col, ddl in [
+            ("shares_outstanding", "ALTER TABLE fundamentals ADD COLUMN shares_outstanding REAL"),
+            ("float_shares",       "ALTER TABLE fundamentals ADD COLUMN float_shares REAL"),
+        ]:
+            if col not in existing_fund:
+                con.execute(ddl)
         # 3. Now safe to create indexes (the columns they reference exist).
         for stmt in SCHEMA.split(";"):
             s = stmt.strip()
@@ -379,6 +453,27 @@ def get_position(pos_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def log_autotrader_step(row: dict) -> int:
+    """Append one paper-autotrader evaluation to the run log. Returns row id."""
+    cols = ["asof", "equity", "free_cash", "realized_pnl", "unrealized_pnl",
+            "peak_equity", "drawdown_pct", "portfolio_heat_pct", "n_open",
+            "opened", "closed", "halted", "note"]
+    vals = [row.get(c) for c in cols]
+    with connect() as con:
+        cur = con.execute(
+            f"INSERT INTO autotrader_log ({','.join(cols)}) "
+            f"VALUES ({','.join(['?'] * len(cols))})", vals)
+        return cur.lastrowid
+
+
+def load_autotrader_log(limit: int = 200) -> pd.DataFrame:
+    """Most-recent-first autotrader run log (equity curve + per-step actions)."""
+    with connect() as con:
+        return pd.read_sql_query(
+            "SELECT * FROM autotrader_log ORDER BY id DESC LIMIT ?", con,
+            params=(limit,))
+
+
 def upsert_earnings(ticker: str, next_earnings: str | None,
                     last_earnings: str | None = None) -> None:
     with connect() as con:
@@ -428,6 +523,46 @@ def load_macro(ticker: str, days: int | None = None) -> pd.DataFrame:
     return df
 
 
+def upsert_intraday(ticker: str, df: pd.DataFrame, interval: str) -> int:
+    """Insert/replace intraday OHLCV bars. df has a DatetimeIndex + OHLCV cols."""
+    if df is None or df.empty:
+        return 0
+    out = df.copy()
+    out.index = pd.to_datetime(out.index).strftime("%Y-%m-%d %H:%M:%S")
+    out = out.reset_index().rename(columns={
+        "index": "datetime", "Datetime": "datetime", "Date": "datetime",
+        "Open": "open", "High": "high", "Low": "low", "Close": "close",
+        "Adj Close": "adj_close", "Volume": "volume",
+    })
+    out.columns = [c.lower() for c in out.columns]
+    rows = [(ticker, interval, r.datetime, getattr(r, "open", None),
+             getattr(r, "high", None), getattr(r, "low", None),
+             getattr(r, "close", None), getattr(r, "volume", None))
+            for r in out.itertuples(index=False)]
+    with connect() as con:
+        con.executemany(
+            "INSERT OR REPLACE INTO prices_intraday "
+            "(ticker,interval,datetime,open,high,low,close,volume) "
+            "VALUES (?,?,?,?,?,?,?,?)", rows,
+        )
+    return len(rows)
+
+
+def load_intraday(ticker: str, interval: str = "5m",
+                  days: int | None = None) -> pd.DataFrame:
+    """Load intraday bars for a ticker/interval, oldest→newest, datetime-indexed."""
+    q = ("SELECT datetime,open,high,low,close,volume FROM prices_intraday "
+         "WHERE ticker=? AND interval=? ORDER BY datetime")
+    with connect() as con:
+        df = pd.read_sql_query(q, con, params=(ticker, interval),
+                               parse_dates=["datetime"])
+    df = df.set_index("datetime")
+    if days:
+        cutoff = df.index.max() - pd.Timedelta(days=days)
+        df = df[df.index >= cutoff]
+    return df
+
+
 def list_macro_tickers() -> list[str]:
     with connect() as con:
         rows = con.execute(
@@ -470,6 +605,69 @@ def holdings_tickers() -> list[str]:
     return [r["ticker"] for r in rows]
 
 
+# ---- Investment plans (intended ₹ per ticker; distinct from positions/holdings) --
+# `plans` is *intent* — how much you mean to deploy on a name and where. It is
+# decoupled from `positions` (paper/real trades) and `holdings` (Groww snapshot,
+# replaced wholesale on import). One active plan per ticker.
+
+def upsert_plan(plan: dict) -> int:
+    """Insert or update the active plan for a ticker. Returns its row id.
+
+    An existing plan whose status is not 'dropped' is updated in place (so the
+    intended amount/levels for a name stay a single row); otherwise a new row is
+    inserted. Recognised keys: ticker, planned_amount, target_price, stop_price,
+    note, status, conviction."""
+    ticker = plan.get("ticker")
+    plan = {**plan, "status": plan.get("status") or "idea"}   # never insert NULL status
+    fields = ["planned_amount", "target_price", "stop_price", "note",
+              "status", "conviction"]
+    with connect() as con:
+        row = con.execute(
+            "SELECT id FROM plans WHERE ticker=? AND (status IS NULL OR status!='dropped') "
+            "ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
+        if row:
+            pid = row["id"]
+            sets = ", ".join(f"{k}=?" for k in fields if k in plan)
+            vals = [plan[k] for k in fields if k in plan]
+            if sets:
+                con.execute(
+                    f"UPDATE plans SET {sets}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    vals + [pid])
+            return pid
+        cols = ["ticker"] + fields
+        vals = [plan.get(c) for c in cols]
+        cur = con.execute(
+            f"INSERT INTO plans ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+            vals)
+        return cur.lastrowid
+
+
+def load_plans(status: str | None = None) -> pd.DataFrame:
+    q = "SELECT * FROM plans"
+    params: tuple = ()
+    if status:
+        q += " WHERE status=?"
+        params = (status,)
+    q += " ORDER BY created_at DESC, id DESC"
+    with connect() as con:
+        return pd.read_sql_query(q, con, params=params)
+
+
+def update_plan(plan_id: int, **fields) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = pd.Timestamp.utcnow().isoformat()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with connect() as con:
+        con.execute(f"UPDATE plans SET {sets} WHERE id=?",
+                    list(fields.values()) + [plan_id])
+
+
+def delete_plan(plan_id: int) -> None:
+    with connect() as con:
+        con.execute("DELETE FROM plans WHERE id=?", (plan_id,))
+
+
 def combined_universe(include_smallcaps: bool = False,
                       include_discovery: bool = False) -> list[str]:
     """Watchlist + holdings deduped — the full set of tickers we should
@@ -497,6 +695,7 @@ def upsert_fundamentals(rows: list[dict]) -> int:
     if not rows:
         return 0
     cols = ["ticker", "short_name", "sector", "industry", "market_cap",
+            "shares_outstanding", "float_shares",
             "trailing_pe", "forward_pe", "price_to_book", "return_on_equity",
             "debt_to_equity", "profit_margin", "operating_margin",
             "earnings_growth", "revenue_growth", "current_ratio",
@@ -527,6 +726,59 @@ def load_fundamentals(min_quality: float | None = None) -> pd.DataFrame:
     q += " ORDER BY quality_score DESC NULLS LAST"
     with connect() as con:
         return pd.read_sql_query(q, con, params=params)
+
+
+def upsert_delivery(rows: list[dict]) -> int:
+    """Insert/replace security-wise delivery rows (ticker, date, qtys, pct)."""
+    if not rows:
+        return 0
+    cols = ["ticker", "date", "traded_qty", "deliv_qty", "deliv_pct"]
+    placeholders = ",".join(["?"] * len(cols))
+    with connect() as con:
+        con.executemany(
+            f"INSERT OR REPLACE INTO delivery ({','.join(cols)}) VALUES ({placeholders})",
+            [tuple(r.get(c) for c in cols) for r in rows],
+        )
+    return len(rows)
+
+
+def load_delivery(ticker: str, days: int | None = None) -> pd.DataFrame:
+    q = "SELECT date, traded_qty, deliv_qty, deliv_pct FROM delivery WHERE ticker=? ORDER BY date"
+    with connect() as con:
+        df = pd.read_sql_query(q, con, params=(ticker,), parse_dates=["date"])
+    df = df.set_index("date")
+    if days:
+        df = df.tail(days)
+    return df
+
+
+def upsert_deals(rows: list[dict]) -> int:
+    """Insert/replace bulk/block deal rows."""
+    if not rows:
+        return 0
+    cols = ["deal_type", "date", "ticker", "security", "client", "side", "qty", "price"]
+    placeholders = ",".join(["?"] * len(cols))
+    with connect() as con:
+        con.executemany(
+            f"INSERT OR REPLACE INTO deals ({','.join(cols)}) VALUES ({placeholders})",
+            [tuple(r.get(c) for c in cols) for r in rows],
+        )
+    return len(rows)
+
+
+def load_deals(ticker: str | None = None, days: int | None = None) -> pd.DataFrame:
+    q = "SELECT deal_type, date, ticker, security, client, side, qty, price FROM deals"
+    params: tuple = ()
+    if ticker:
+        q += " WHERE ticker=?"
+        params = (ticker,)
+    q += " ORDER BY date DESC"
+    with connect() as con:
+        df = pd.read_sql_query(q, con, params=params, parse_dates=["date"])
+    if days and not df.empty:
+        cutoff = df["date"].max() - pd.Timedelta(days=days)
+        df = df[df["date"] >= cutoff]
+    return df
 
 
 def load_earnings_calendar() -> pd.DataFrame:

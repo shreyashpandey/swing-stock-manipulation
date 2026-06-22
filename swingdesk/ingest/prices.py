@@ -4,7 +4,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import yfinance as yf
 from rich.console import Console
 
 from swingdesk.storage import upsert_prices
@@ -14,6 +13,7 @@ console = Console()
 
 def fetch_one(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
     """Fetch OHLCV for a single ticker via yfinance."""
+    import yfinance as yf  # lazy: keep heavy import off app startup
     try:
         df = yf.download(
             ticker,

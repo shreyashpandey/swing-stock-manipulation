@@ -22,7 +22,6 @@ flagged as "primary drivers" so the user understands WHY a stock is moving.
 from __future__ import annotations
 
 import pandas as pd
-import yfinance as yf
 from rich.console import Console
 
 from swingdesk.storage import load_macro, load_prices, upsert_macro
@@ -50,6 +49,7 @@ MACRO_TICKERS = [
 
 def ingest(period: str = "1y") -> dict[str, int]:
     """Fetch all macro tickers. Returns rows-written per ticker."""
+    import yfinance as yf  # lazy: keep heavy import off app startup
     out = {}
     for tk, name, _ in MACRO_TICKERS:
         try:

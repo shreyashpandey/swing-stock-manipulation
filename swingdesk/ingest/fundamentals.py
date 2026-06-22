@@ -21,7 +21,6 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import yfinance as yf
 from rich.console import Console
 
 from swingdesk.storage import upsert_fundamentals
@@ -54,6 +53,7 @@ def _normalize_d_to_e(raw, sector: str | None) -> float | None:
 
 
 def fetch_one(ticker: str) -> dict | None:
+    import yfinance as yf  # lazy: keep heavy import off app startup
     try:
         info = yf.Ticker(ticker).info
         if not info or not info.get("shortName"):
@@ -65,6 +65,8 @@ def fetch_one(ticker: str) -> dict | None:
             "sector": sector,
             "industry": info.get("industry"),
             "market_cap": _safe(info.get("marketCap")),
+            "shares_outstanding": _safe(info.get("sharesOutstanding")),
+            "float_shares": _safe(info.get("floatShares")),
             "trailing_pe": _safe(info.get("trailingPE")),
             "forward_pe": _safe(info.get("forwardPE")),
             "price_to_book": _safe(info.get("priceToBook")),

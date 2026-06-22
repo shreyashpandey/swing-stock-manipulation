@@ -251,7 +251,8 @@ def test_ingest_handles_yfinance_payload(tmp_db):
         "dividendYield": 0.015,
         "beta": 1.1,
     }
-    with patch("swingdesk.ingest.fundamentals.yf.Ticker") as MockT:
+    # yfinance is lazily imported inside fetch_one, so patch the real module.
+    with patch("yfinance.Ticker") as MockT:
         MockT.return_value.info = fake_info
         n = fi.ingest(["TEST.NS"], workers=1)
     assert n == 1

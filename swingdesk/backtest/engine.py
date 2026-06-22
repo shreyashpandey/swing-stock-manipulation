@@ -98,8 +98,15 @@ def backtest_ticker(
     max_hold: int = 20,
     warmup: int = 60,
     detectors: list[Callable] | None = None,
+    require_uptrend: bool = False,
 ) -> list[Trade]:
-    """Run all detectors over the full history of one ticker. Returns closed trades."""
+    """Run all detectors over the full history of one ticker. Returns closed trades.
+
+    require_uptrend: if True, only take a (long) entry when the close is above
+    the 200-day EMA. Evidence (exit_tuner sweep, 2026-06) shows this trend gate
+    is the single biggest expectancy improver — it lifts the whole book's profit
+    factor from ~0.83 to ~0.95 — far more than any exit tweak.
+    """
     df = load_prices(ticker)
     if df.empty or len(df) < warmup + 5:
         return []
@@ -114,6 +121,12 @@ def backtest_ticker(
 
     for i in range(warmup, len(df) - 1):
         window = df.iloc[: i + 1]
+        # Trend gate: skip everything below the 200-EMA (don't fight the tide).
+        if require_uptrend:
+            bar = df.iloc[i]
+            e200 = bar.get("ema200")
+            if e200 is None or pd.isna(e200) or bar["close"] <= e200:
+                continue
         for fn in use_detectors:
             try:
                 sig = fn(window, ticker)
@@ -153,11 +166,13 @@ def backtest_universe(
     *,
     max_hold: int = 20,
     warmup: int = 60,
+    require_uptrend: bool = False,
 ) -> pd.DataFrame:
     """Backtest every ticker; return a flat DataFrame of all trades."""
     all_trades: list[Trade] = []
     for t in tickers:
-        trades = backtest_ticker(t, max_hold=max_hold, warmup=warmup)
+        trades = backtest_ticker(t, max_hold=max_hold, warmup=warmup,
+                                 require_uptrend=require_uptrend)
         if trades:
             console.print(f"  {t:>15}: {len(trades)} trades")
         all_trades.extend(trades)

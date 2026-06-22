@@ -13,16 +13,33 @@ class StrategyStats:
     n_trades: int
     wins: int
     losses: int
-    win_rate: float            # 0..1
-    avg_r: float               # mean R per trade
-    total_r: float             # sum of R
-    expectancy: float          # win_rate*avg_win + (1-win_rate)*avg_loss
+    win_rate: float            # 0..1 (NET of costs)
+    avg_r: float               # mean R per trade (NET)
+    total_r: float             # sum of R (NET)
+    expectancy: float          # win_rate*avg_win + (1-win_rate)*avg_loss (NET)
     avg_win_r: float
     avg_loss_r: float
-    profit_factor: float       # gross_wins / abs(gross_losses)
+    profit_factor: float       # gross_wins / abs(gross_losses) (NET)
     max_consec_losses: int
-    max_drawdown_r: float      # max equity-curve drawdown in R units
+    max_drawdown_r: float      # max equity-curve drawdown in R units (NET)
     avg_bars_held: float
+    gross_avg_r: float = 0.0   # mean R BEFORE costs (for the haircut comparison)
+    avg_cost_r: float = 0.0    # mean per-trade cost in R units
+
+
+def net_returns(trades: pd.DataFrame, cost_pct: float):
+    """Per-trade gross R, net R and cost-in-R for a round-trip cost of
+    `cost_pct`% of notional. Cost in R = cost_pct% × entry ÷ (entry − stop),
+    i.e. tighter stops cost more R. Falls back to zero cost when stop levels
+    aren't available."""
+    gross = trades["r"].astype(float)
+    if cost_pct <= 0 or "entry" not in trades or "stoploss" not in trades:
+        cost = pd.Series(0.0, index=trades.index)
+    else:
+        risk = trades["entry"].astype(float) - trades["stoploss"].astype(float)
+        cost = (cost_pct / 100.0) * trades["entry"].astype(float) / risk.where(risk > 0)
+        cost = cost.fillna(0.0).clip(lower=0.0)
+    return gross, gross - cost, cost
 
 
 def _max_consec_losses(rs: pd.Series) -> int:
@@ -46,10 +63,13 @@ def _max_drawdown_r(rs: pd.Series) -> float:
     return float(dd.max())
 
 
-def _stats_for_subset(name: str, trades: pd.DataFrame) -> StrategyStats:
-    rs = trades["r"].dropna()
+def _stats_for_subset(name: str, trades: pd.DataFrame, cost_pct: float = 0.0) -> StrategyStats:
+    gross_all, net_all, cost_all = net_returns(trades, cost_pct)
+    rs = net_all.dropna()                       # NET R drives all headline stats
     if rs.empty:
         return StrategyStats(name, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0)
+    gross = gross_all.loc[rs.index]
+    cost = cost_all.loc[rs.index]
 
     wins = rs[rs > 0]
     losses = rs[rs <= 0]
@@ -76,20 +96,25 @@ def _stats_for_subset(name: str, trades: pd.DataFrame) -> StrategyStats:
         max_consec_losses=int(_max_consec_losses(rs)),
         max_drawdown_r=round(float(_max_drawdown_r(rs)), 2),
         avg_bars_held=round(float(trades["bars_held"].mean()), 1) if "bars_held" in trades else 0.0,
+        gross_avg_r=round(float(gross.mean()), 3),
+        avg_cost_r=round(float(cost.mean()), 3),
     )
 
 
-def summarize(trades: pd.DataFrame) -> pd.DataFrame:
-    """One row per setup + an 'all' row."""
+def summarize(trades: pd.DataFrame, cost_pct: float = 0.0) -> pd.DataFrame:
+    """One row per setup + an 'ALL' row. All headline stats are NET of a
+    `cost_pct`% round-trip cost (0 = gross). `gross_avg_r`/`avg_cost_r` columns
+    expose the haircut."""
     if trades.empty:
         return pd.DataFrame()
 
     # Trades are in arbitrary order; sort chronologically for drawdown calc
     df = trades.sort_values("entry_date") if "entry_date" in trades else trades.copy()
 
-    rows = [asdict(_stats_for_subset("ALL", df))]
+    rows = [asdict(_stats_for_subset("ALL", df, cost_pct))]
     for setup, sub in df.groupby("setup"):
-        rows.append(asdict(_stats_for_subset(setup, sub.sort_values("entry_date") if "entry_date" in sub else sub)))
+        sub = sub.sort_values("entry_date") if "entry_date" in sub else sub
+        rows.append(asdict(_stats_for_subset(setup, sub, cost_pct)))
 
     out = pd.DataFrame(rows)
     return out

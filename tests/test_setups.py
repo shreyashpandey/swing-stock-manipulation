@@ -128,6 +128,58 @@ def test_pullback_returns_dict_or_none(synth_ohlcv):
     assert out is None or {"entry", "stoploss", "target", "rr", "setup"} <= out.keys()
 
 
+# ---- new strategy detectors ----------------------------------------------------
+
+def _scan_history(detector, df):
+    """Run one detector bar-by-bar (like chart_signals) and return every signal
+    it produced — for cross/flip detectors whose trigger lands on a given bar."""
+    out = []
+    for i in range(60, len(df)):
+        sig = detector(df.iloc[: i + 1], "X.NS")
+        if sig:
+            out.append(sig)
+    return out
+
+
+def test_detectors_registry_well_formed():
+    assert len(setups.DETECTORS) == 10
+    names = {fn.__name__ for fn in setups.DETECTORS}
+    assert len(names) == 10
+    assert all(callable(fn) for fn in setups.DETECTORS)
+
+
+def test_golden_cross_triggers():
+    # Flat well past bar 210 (so the detector's 210-bar warmup is satisfied),
+    # THEN a ramp so the 50-EMA crosses the 200-EMA after warmup completes.
+    n = 280
+    closes = ([100.0] * 216) + np.linspace(100, 175, n - 216).tolist()
+    df = add_indicators(_frame(closes))
+    sigs = _scan_history(setups.detect_golden_cross, df)
+    assert sigs, "golden cross should fire on a flat→ramp series"
+    s = sigs[0]
+    assert s["setup"] == "golden_cross"
+    assert s["target"] > s["entry"] > s["stoploss"]
+    assert s["rr"] > 1.0
+
+
+def test_new_detectors_return_valid_shape():
+    # Whatever fires on a long trending series must carry a complete bracket.
+    n = 260
+    closes = np.linspace(100, 180, n).tolist()
+    vols = [500_000.0] * n
+    vols[-1] = 1_500_000.0
+    df = add_indicators(_frame(closes, vols=vols))
+    required = {"ticker", "setup", "entry", "stoploss", "target", "rr", "score", "notes"}
+    for fn in (setups.detect_macd_cross, setups.detect_supertrend_flip,
+               setups.detect_bollinger_breakout, setups.detect_rsi_reversal,
+               setups.detect_adx_trend):
+        sig = fn(df, "X.NS")
+        if sig:
+            assert required <= sig.keys()
+            assert sig["entry"] > sig["stoploss"]
+            assert sig["target"] > sig["entry"]
+
+
 # ---- scan_ticker integration ---------------------------------------------------
 
 def test_scan_ticker_runs(tmp_db, synth_ohlcv):
@@ -147,3 +199,22 @@ def test_scan_all_persists(tmp_db, synth_ohlcv):
     df = storage.load_signals(limit=50)
     # Synthetic data may or may not produce signals — main assertion: no crash & shape ok.
     assert isinstance(df, pd.DataFrame)
+
+
+def test_uptrend_gate_blocks_counter_trend(tmp_db):
+    """A clear downtrend (price well below its 200-EMA) emits no signals with the
+    trend gate on, but the gate can be disabled."""
+    from swingdesk import storage
+    n = 260
+    closes = np.linspace(300, 120, n)            # persistent downtrend
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    df = pd.DataFrame({
+        "open": closes + 0.1, "high": closes + 1.0,
+        "low": closes - 1.0, "close": closes,
+        "volume": np.full(n, 8e5),
+    }, index=idx)
+    storage.upsert_prices("DOWN.NS", df)
+    assert setups.scan_ticker("DOWN.NS", require_uptrend=True) == []
+    # With the gate off, detectors are free to fire (or not) — just no gating.
+    gated_off = setups.scan_ticker("DOWN.NS", require_uptrend=False)
+    assert isinstance(gated_off, list)
