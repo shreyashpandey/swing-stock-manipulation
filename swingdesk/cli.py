@@ -14,6 +14,7 @@ from swingdesk.analyze import score, sentiment
 from swingdesk.analyze.setups import scan_all
 from swingdesk.config import DEFAULT_WATCHLIST
 from swingdesk.ingest import earnings as earnings_ingest
+from swingdesk.ingest import global_news as global_news_ingest
 from swingdesk.ingest import fundamentals as fundamentals_ingest
 from swingdesk.ingest import macro as macro_ingest
 from swingdesk.ingest import nse as nse_ingest
@@ -72,6 +73,9 @@ def cmd_news(args):
     console.print(f"[bold]Fetching news (matching against {len(universe)} tickers)[/bold]")
     n = news_rss.ingest(universe)
     console.print(f"[green]{n} new news items[/green]")
+    if getattr(args, "retag", False):
+        m = news_rss.retag_news(universe)
+        console.print(f"[green]re-tagged {m} existing news rows[/green]")
 
 
 def cmd_scan(args):
@@ -555,9 +559,14 @@ def cmd_holdings(args):
 def cmd_fundamentals(args):
     init_db()
     seed_watchlist_if_empty(DEFAULT_WATCHLIST)
-    universe = combined_universe()
-    console.print(f"[bold]Fetching fundamentals for {len(universe)} tickers "
-                  f"(watchlist + holdings)[/bold]")
+    # --extended fetches fundamentals across the broad ~Nifty-500 universe so
+    # company-name -> ticker aliases populate (lights up news tagging for names
+    # like VA Tech Wabag / Aegis / Kirloskar). It's a heavy one-time yfinance run.
+    universe = combined_universe(include_smallcaps=args.extended,
+                                  include_discovery=args.extended,
+                                  include_extended=args.extended)
+    console.print(f"[bold]Fetching fundamentals for {len(universe)} tickers"
+                  f"{' (extended universe)' if args.extended else ' (watchlist + holdings)'}[/bold]")
     fundamentals_ingest.ingest(universe)
 
 
@@ -565,10 +574,69 @@ def cmd_nse(args):
     """Pull NSE delivery % + bulk/block deals for the universe (manipulation section)."""
     init_db()
     seed_watchlist_if_empty(DEFAULT_WATCHLIST)
-    universe = combined_universe()
+    universe = combined_universe(include_smallcaps=args.extended,
+                                  include_discovery=args.extended,
+                                  include_extended=args.extended)
     console.print(f"[bold]Fetching NSE delivery ({args.days}d) + deals for "
                   f"{len(universe)} tickers[/bold]")
-    nse_ingest.ingest(universe, days=args.days)
+    if args.all_deals:
+        # Capture EVERY bulk/block deal market-wide (not just our universe) so the
+        # institutional-flow scanner sees who's buying anything, anywhere.
+        nse_ingest.ingest_delivery(universe, days=args.days)
+        nse_ingest.ingest_deals(None)
+    else:
+        nse_ingest.ingest(universe, days=args.days)
+
+
+def cmd_catalyst(args):
+    """News-first scanner: stocks where a catalyst is driving a move."""
+    from swingdesk.analyze import catalyst
+    init_db()
+    hits = catalyst.scan_catalysts(days=args.days, limit=args.limit)
+    if not hits:
+        console.print("[yellow]No recent catalysts. Run `news` + `sentiment` first.[/yellow]")
+        return
+    console.rule(f"[bold]News-catalyst scanner — last {args.days}d ({len(hits)} names)")
+    arrow = {"bullish": "[green]▲[/green]", "bearish": "[red]▼[/red]", "mixed": "[yellow]◆[/yellow]"}
+    for h in hits:
+        new = "" if h.in_universe else "  [magenta]🆕 outside watchlist[/magenta]"
+        ret = f"{h.ret_pct:+.1f}%" if h.ret_pct is not None else "—"
+        rvol = f"{h.rvol:.1f}x" if h.rvol is not None else "—"
+        console.print(
+            f"  {arrow.get(h.direction, '◆')} {h.strength:>5.1f}  {h.ticker:>14}  "
+            f"news={h.bullish}↑/{h.bearish}↓(hi={h.high_impact})  "
+            f"{ret:<7} vol={rvol:<6} {h.top_event or ''}{new}"
+        )
+        if h.top_headline:
+            console.print(f"        [dim]{h.top_headline[:110]}[/dim]")
+
+
+def cmd_institutional(args):
+    """Smart-money: bulk/block deal flow + sell-side brokerage calls."""
+    from swingdesk.analyze import institutional as inst
+    init_db()
+    flows = inst.recent_institutional_flow(days=args.days, only_marquee=args.marquee,
+                                           limit=args.limit)
+    console.rule(f"[bold]Institutional deal flow — last {args.days}d"
+                 f"{' (marquee only)' if args.marquee else ''}")
+    if not flows:
+        console.print("[yellow]No deals stored. Run `nse --all-deals` first.[/yellow]")
+    for f in flows:
+        side = ("[green]NET BUY[/green]" if f.net_side == "BUY" else
+                "[red]NET SELL[/red]" if f.net_side == "SELL" else "FLAT")
+        mq = f"  [bold cyan]{' · '.join(f.marquee)}[/bold cyan]" if f.marquee else ""
+        cr = f" ₹{f.net_value / 1e7:,.1f}cr" if f.net_value else ""
+        console.print(f"  {f.ticker:>14}  {side}{cr}  deals={f.n_deals}{mq}")
+        for name, cside in f.clients[:4]:
+            console.print(f"        [dim]{cside:<4} {name[:60]}[/dim]")
+
+    actions = inst.brokerage_actions(days=args.days, limit=args.limit)
+    if actions:
+        console.rule("[bold]Brokerage calls (sell-side desks)")
+        for a in actions:
+            color = "green" if a.sentiment == "bullish" else "red"
+            console.print(f"  [{color}]{a.broker}[/{color}]  {a.action}  "
+                          f"{a.ticker or '—':>12}  [dim]{a.headline[:90]}[/dim]")
 
 
 def cmd_screen(args):
@@ -665,6 +733,112 @@ def cmd_watchlist(args):
         console.print("\n".join(wl) if wl else "[yellow](empty)[/yellow]")
 
 
+def cmd_global_news(args):
+    init_db()
+    n = global_news_ingest.ingest(per_feed=args.per_feed)
+    console.print(f"[green]{n} new global impact item(s)[/green]")
+
+    from swingdesk.analyze import global_impact
+    df = global_impact.recent_impacts(days=args.days, limit=args.limit)
+    if df.empty:
+        console.print("[yellow]no mapped global impacts yet[/yellow]")
+        return
+    cols = ["published", "source", "cue", "direction", "impact_score",
+            "sectors", "tickers", "title"]
+    cols = [c for c in cols if c in df.columns]
+    console.print(df[cols].to_string(index=False))
+
+
+def cmd_sudden_radar(args):
+    from swingdesk.analyze import sudden_move
+    init_db()
+    universe = combined_universe(include_smallcaps=args.include_smallcaps,
+                                  include_discovery=args.include_discovery)
+    df = sudden_move.scan(universe, include_intraday=args.intraday, limit=args.limit,
+                          include_smallcaps=False, include_discovery=False)
+    if df.empty:
+        console.print("[yellow]no radar rows — fetch prices/fundamentals first[/yellow]")
+        return
+    cols = ["ticker", "radar_score", "readiness", "last", "compression",
+            "accumulation", "prebreakout", "relative_strength", "catalyst",
+            "intraday_confirm", "manip_penalty", "reasons", "risks"]
+    console.rule("[bold]Sudden Move Radar — setup pressure, not a guarantee")
+    console.print(df[cols].to_string(index=False))
+
+
+def cmd_sudden_backtest(args):
+    from swingdesk.analyze import sudden_move
+    init_db()
+    tickers = [args.ticker] if args.ticker else combined_universe(
+        include_smallcaps=args.include_smallcaps,
+        include_discovery=args.include_discovery)
+    trades, summary = sudden_move.backtest(
+        tickers, min_score=args.min_score,
+        move_threshold_pct=args.move_threshold,
+        horizon=args.horizon)
+    console.rule("[bold]Sudden Move Radar backtest")
+    console.print(summary)
+    if trades.empty:
+        console.print("[yellow]no qualifying historical setups[/yellow]")
+        return
+    console.print(
+        trades.sort_values("radar_score", ascending=False).head(args.limit).to_string(index=False)
+    )
+
+
+def cmd_market_flow(args):
+    from swingdesk.analyze import market_flow
+    init_db()
+    state = market_flow.current_flow()
+    console.rule("[bold]Market flow")
+    console.print({
+        "flow": state.flow,
+        "score": state.score,
+        "nifty_trend": state.nifty_trend,
+        "volatility": state.volatility,
+        "reason": state.reason,
+    })
+    if args.backtest:
+        stats, _ = market_flow.strategy_flow_backtest(
+            combined_universe(include_smallcaps=args.include_smallcaps),
+            max_hold=args.max_hold, min_trades=args.min_trades)
+        if stats.empty:
+            console.print("[yellow]no strategy-flow stats — run macro + prices first[/yellow]")
+        else:
+            console.rule("[bold]Strategy edge by market flow")
+            console.print(stats.to_string(index=False))
+
+
+def cmd_confluence(args):
+    from swingdesk.analyze import market_flow
+    init_db()
+    universe = combined_universe(include_smallcaps=args.include_smallcaps,
+                                  include_discovery=args.include_discovery)
+    df = market_flow.confluence_board(universe, limit=args.limit,
+                                      include_intraday=args.intraday,
+                                      target_move_pct=args.target_move)
+    if df.empty:
+        console.print("[yellow]no confluence rows — run prices/fundamentals/macro first[/yellow]")
+        return
+    console.rule("[bold]Confluence Board — market-flow aware ranking")
+    console.print(df.to_string(index=False))
+
+
+def cmd_explosive_backtest(args):
+    from swingdesk.analyze import market_flow
+    init_db()
+    universe = [args.ticker] if args.ticker else combined_universe(
+        include_smallcaps=args.include_smallcaps,
+        include_discovery=args.include_discovery)
+    trades, summary = market_flow.explosive_move_backtest(
+        universe, target_move_pct=args.target_move,
+        min_explosive_score=args.min_score)
+    console.rule("[bold]Explosive move backtest")
+    console.print(summary)
+    if not trades.empty:
+        console.print(trades.sort_values("explosive_score", ascending=False).head(args.limit).to_string(index=False))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="swingdesk", description="Local swing-trading signal app")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -682,6 +856,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="Tag against the small-cap universe too (default: True)")
     p.add_argument("--include-discovery", action="store_true", default=True,
                    help="Tag against the discovery universe too (default: True)")
+    p.add_argument("--retag", action="store_true",
+                   help="Also re-tag previously stored news with the current universe/aliases")
     p.set_defaults(func=cmd_news)
 
     p = sub.add_parser("scan", help="Run technical scanners + sentiment scoring, persist signals")
@@ -827,12 +1003,81 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Week 5 commands ----
     p = sub.add_parser("fundamentals", help="Fetch fundamental ratios per ticker (yfinance)")
+    p.add_argument("--extended", action="store_true",
+                   help="Fetch across the broad ~Nifty-500 universe (populates name->ticker aliases)")
     p.set_defaults(func=cmd_fundamentals)
 
     p = sub.add_parser("nse", help="Fetch NSE delivery %% + bulk/block deals (manipulation section)")
+    p.add_argument("--extended", action="store_true",
+                   help="Cover the broad ~Nifty-500 universe")
+    p.add_argument("--all-deals", action="store_true",
+                   help="Capture every bulk/block deal market-wide (for the institutional-flow scanner)")
     p.add_argument("--days", type=int, default=20,
                    help="Trading days of delivery history to backfill (default 20)")
     p.set_defaults(func=cmd_nse)
+
+    p = sub.add_parser("catalyst", help="News-first scanner: stocks where a catalyst is driving a move")
+    p.add_argument("--days", type=int, default=3, help="Lookback window in days")
+    p.add_argument("--limit", type=int, default=25, help="Max names to show")
+    p.set_defaults(func=cmd_catalyst)
+
+    p = sub.add_parser("institutional", help="Smart-money: bulk/block deal flow + brokerage calls")
+    p.add_argument("--days", type=int, default=30, help="Lookback window in days")
+    p.add_argument("--limit", type=int, default=30, help="Max names to show")
+    p.add_argument("--marquee", action="store_true",
+                   help="Only stocks with a marquee institution (BlackRock/MS/JPM/…) on the tape")
+    p.set_defaults(func=cmd_institutional)
+
+    p = sub.add_parser("global-news", help="Fetch global market news and map Indian impact")
+    p.add_argument("--per-feed", type=int, default=40, help="Max RSS items per feed")
+    p.add_argument("--days", type=int, default=3, help="Show mapped impacts from last N days")
+    p.add_argument("--limit", type=int, default=30, help="Rows to print")
+    p.set_defaults(func=cmd_global_news)
+
+    p = sub.add_parser("sudden-radar", help="Rank stocks with pressure for sudden upside moves")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--intraday", action="store_true",
+                   help="Use stored intraday bars for ORB/VWAP/RVOL confirmation")
+    p.add_argument("--include-smallcaps", action="store_true", default=True)
+    p.add_argument("--include-discovery", action="store_true")
+    p.set_defaults(func=cmd_sudden_radar)
+
+    p = sub.add_parser("sudden-backtest", help="Backtest sudden-move radar hit rates")
+    p.add_argument("--ticker", help="Backtest one ticker only")
+    p.add_argument("--min-score", type=float, default=70.0)
+    p.add_argument("--move-threshold", type=float, default=3.0,
+                   help="Next-horizon high/close move counted as a hit")
+    p.add_argument("--horizon", type=int, default=1)
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--include-smallcaps", action="store_true", default=True)
+    p.add_argument("--include-discovery", action="store_true")
+    p.set_defaults(func=cmd_sudden_backtest)
+
+    p = sub.add_parser("market-flow", help="Show current market flow and strategy edge by flow")
+    p.add_argument("--backtest", action="store_true",
+                   help="Backtest setup families grouped by historical market flow")
+    p.add_argument("--max-hold", type=int, default=20)
+    p.add_argument("--min-trades", type=int, default=5)
+    p.add_argument("--include-smallcaps", action="store_true")
+    p.set_defaults(func=cmd_market_flow)
+
+    p = sub.add_parser("confluence", help="Fuse all tabs into one market-flow-aware board")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--intraday", action="store_true")
+    p.add_argument("--target-move", type=float, default=10.0,
+                   help="One-day intraday move target to rank for (e.g. 10 or 15)")
+    p.add_argument("--include-smallcaps", action="store_true", default=True)
+    p.add_argument("--include-discovery", action="store_true")
+    p.set_defaults(func=cmd_confluence)
+
+    p = sub.add_parser("explosive-backtest", help="Backtest +10/+15%% one-day explosive filter")
+    p.add_argument("--ticker", help="Backtest one ticker only")
+    p.add_argument("--target-move", type=float, default=10.0)
+    p.add_argument("--min-score", type=float, default=70.0)
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--include-smallcaps", action="store_true", default=True)
+    p.add_argument("--include-discovery", action="store_true")
+    p.set_defaults(func=cmd_explosive_backtest)
 
     p = sub.add_parser("screen", help="Rank watchlist by fundamental quality")
     p.add_argument("--min-score", type=float, default=60.0,

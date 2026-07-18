@@ -42,7 +42,9 @@ def _clean_livesquawk(text: str) -> str:
     return t.strip()
 
 
-def scrape_livesquawk(watchlist: list[str], html: str | None = None) -> list[dict]:
+def scrape_livesquawk(universe: list[str] | set[str],
+                      alias_map: dict[str, list[str]] | None = None,
+                      html: str | None = None) -> list[dict]:
     url = "https://www.livesquawk.com/latest-news"
     soup = BeautifulSoup(html if html is not None else _get(url), "lxml")
     items, seen = [], set()
@@ -57,11 +59,13 @@ def scrape_livesquawk(watchlist: list[str], html: str | None = None) -> list[dic
         seen.add(link)
         items.append({"source": "LiveSquawk", "title": title, "link": link,
                       "published": None, "summary": "",
-                      "tickers": _match_tickers(title, watchlist)})
+                      "tickers": _match_tickers(title, universe, alias_map)})
     return items
 
 
-def scrape_marketsmojo(watchlist: list[str], html: str | None = None) -> list[dict]:
+def scrape_marketsmojo(universe: list[str] | set[str],
+                       alias_map: dict[str, list[str]] | None = None,
+                       html: str | None = None) -> list[dict]:
     url = "https://www.marketsmojo.com/news/stock-market-news"
     soup = BeautifulSoup(html if html is not None else _get(url), "lxml")
     items, seen = [], set()
@@ -78,21 +82,22 @@ def scrape_marketsmojo(watchlist: list[str], html: str | None = None) -> list[di
         seen.add(link)
         items.append({"source": "MarketsMojo", "title": title, "link": link,
                       "published": None, "summary": "",
-                      "tickers": _match_tickers(title, watchlist)})
+                      "tickers": _match_tickers(title, universe, alias_map)})
     return items
 
 
 SCRAPERS = [("LiveSquawk", scrape_livesquawk), ("MarketsMojo", scrape_marketsmojo)]
 
 
-def ingest(watchlist: list[str]) -> int:
+def ingest(universe: list[str] | set[str],
+           alias_map: dict[str, list[str]] | None = None) -> int:
     """Scrape all non-RSS sources and persist via insert_news. Mirrors
     news_rss.ingest's return (count of new rows)."""
     from swingdesk.storage import insert_news
     total = 0
     for name, fn in SCRAPERS:
         try:
-            items = fn(watchlist)
+            items = fn(universe, alias_map)
             n = insert_news(items)
             total += n
             console.print(f"  scrape: {name:>20} -> {len(items):>3} items ({n} new)")

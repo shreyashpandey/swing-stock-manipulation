@@ -7,7 +7,7 @@ from email.utils import parsedate_to_datetime
 import feedparser
 from rich.console import Console
 
-from swingdesk.storage import insert_news
+from swingdesk.storage import combined_universe, insert_news, load_fundamentals
 
 console = Console()
 
@@ -68,23 +68,11 @@ def _normalize_date(entry) -> str | None:
     return None
 
 
-def _match_tickers(text: str, watchlist: list[str]) -> list[str]:
-    """Match plain company name / symbol mentions in headlines.
-
-    We strip the .NS / .BO suffix and also try a 'pretty' form (e.g. HDFCBANK -> HDFC Bank
-    is too aggressive, so we rely on the bare symbol token plus a small alias map).
-    """
-    if not text:
-        return []
-    upper = text.upper()
-    hits: set[str] = set()
-    for t in watchlist:
-        base = t.split(".")[0]
-        # symbol token must appear as a word (avoid matching 'ITC' inside 'WITCH')
-        if re.search(rf"\b{re.escape(base)}\b", upper):
-            hits.add(t)
-    # Aliases for common names that don't appear as the symbol in prose.
-    aliases = {
+# Curated name->ticker aliases for names that don't appear as the bare symbol in
+# prose. build_alias_map() supplements these at runtime with aliases derived from
+# fundamentals.short_name (universe-wide, no manual upkeep); the curated entries
+# here stay as hand-tuned overrides for tricky names.
+_CURATED_ALIASES: dict[str, list[str]] = {
         "RELIANCE.NS": ["RELIANCE", "RIL"],
         "TCS.NS": ["TCS", "TATA CONSULTANCY"],
         "INFY.NS": ["INFOSYS"],
@@ -213,19 +201,99 @@ def _match_tickers(text: str, watchlist: list[str]) -> list[str]:
         "AVANTIFEED.NS": ["AVANTI FEEDS"],
         "POONAWALLA.NS": ["POONAWALLA FINCORP"],
         "MANAPPURAM.NS": ["MANAPPURAM FINANCE"],
-    }
-    for tkr, names in aliases.items():
-        if tkr not in watchlist:
+}
+
+# Corporate-form tokens trimmed from a company name when deriving an alias.
+_NAME_SUFFIXES = {
+    "LIMITED", "LTD", "PVT", "PRIVATE", "CORPORATION", "CORP", "CO",
+    "COMPANY", "INC", "INDIA",
+}
+
+
+def _normalize_company_name(name: str | None) -> str | None:
+    """Turn a fundamentals short_name into a clean prose alias.
+
+    'Bharat Forge Ltd' -> 'BHARAT FORGE'; 'VA Tech Wabag Limited' -> 'VA TECH WABAG';
+    'NOCIL Limited' -> 'NOCIL'. Returns None when nothing usable remains (too short).
+    """
+    if not name:
+        return None
+    cleaned = re.sub(r"\([^)]*\)", " ", name)            # drop "(India)" etc.
+    cleaned = re.sub(r"[^A-Za-z0-9& ]+", " ", cleaned)    # punctuation -> space
+    tokens = cleaned.upper().split()
+    while tokens and tokens[-1] in _NAME_SUFFIXES:        # strip trailing Ltd / Limited / ...
+        tokens.pop()
+    alias = " ".join(tokens).strip()
+    # Guard: too-short aliases (<4 chars) false-match in prose; let the bare
+    # symbol token / curated map handle those.
+    return alias if len(alias) >= 4 else None
+
+
+def build_alias_map(universe: list[str] | set[str]) -> dict[str, list[str]]:
+    """Derive a name->ticker alias map from stored fundamentals.short_name,
+    scoped to `universe`.
+
+    This is the fix for the news blind spot: every stock we have fundamentals for
+    resolves by its company name automatically, so a headline like 'Bharat Forge
+    wins defence order' or 'VA Tech Wabag bags contract' tags the right ticker
+    with NO hand-maintained alias. Returns {} if fundamentals aren't ingested yet.
+    """
+    uni = set(universe)
+    derived: dict[str, list[str]] = {}
+    try:
+        fund = load_fundamentals()
+    except Exception:
+        return derived
+    if fund is None or fund.empty or "ticker" not in fund.columns \
+            or "short_name" not in fund.columns:
+        return derived
+    for tkr, short_name in zip(fund["ticker"], fund["short_name"]):
+        if tkr not in uni:
             continue
-        for nm in names:
-            # Word-boundary match: prevents "ITC" inside "WITCH" from triggering.
-            if re.search(rf"\b{re.escape(nm)}\b", upper):
-                hits.add(tkr)
-                break
+        alias = _normalize_company_name(None if short_name is None else str(short_name))
+        if alias:
+            derived[tkr] = [alias]
+    return derived
+
+
+def _match_tickers(text: str, universe: list[str] | set[str],
+                   alias_map: dict[str, list[str]] | None = None) -> list[str]:
+    """Match company / symbol mentions in a headline to tickers in `universe`.
+
+    Three word-boundary-matched passes (a ticker only needs one to hit):
+      1. the bare symbol token (e.g. 'NOCIL');
+      2. curated aliases (_CURATED_ALIASES) for hand-tuned names;
+      3. derived aliases (`alias_map`, from build_alias_map) — the universe-wide
+         auto map built from fundamentals.
+    Only tickers present in `universe` can be returned, so passing a broad
+    `alias_map` is safe.
+    """
+    if not text:
+        return []
+    uni = set(universe)
+    upper = text.upper()
+    hits: set[str] = set()
+
+    # 1. Bare symbol token (word-boundary so 'ITC' won't match inside 'WITCH').
+    for t in uni:
+        base = t.split(".")[0]
+        if re.search(rf"\b{re.escape(base)}\b", upper):
+            hits.add(t)
+
+    # 2 + 3. Curated then derived aliases, gated to the universe.
+    for source in (_CURATED_ALIASES, alias_map or {}):
+        for tkr, names in source.items():
+            if tkr in hits or tkr not in uni:
+                continue
+            for nm in names:
+                if re.search(rf"\b{re.escape(nm)}\b", upper):
+                    hits.add(tkr)
+                    break
     return sorted(hits)
 
 
-def fetch_feed(name: str, url: str, watchlist: list[str]) -> list[dict]:
+def fetch_feed(name: str, url: str, universe: list[str] | set[str],
+               alias_map: dict[str, list[str]] | None = None) -> list[dict]:
     feed = feedparser.parse(url)
     items = []
     for e in feed.entries:
@@ -235,7 +303,7 @@ def fetch_feed(name: str, url: str, watchlist: list[str]) -> list[dict]:
             continue
         summary = (e.get("summary") or "").strip()
         published = _normalize_date(e)
-        tickers = _match_tickers(f"{title} {summary}", watchlist)
+        tickers = _match_tickers(f"{title} {summary}", universe, alias_map)
         items.append({
             "source": name,
             "title": title,
@@ -247,11 +315,25 @@ def fetch_feed(name: str, url: str, watchlist: list[str]) -> list[dict]:
     return items
 
 
-def ingest(watchlist: list[str]) -> int:
+def _tagging_context(universe: list[str] | None) -> tuple[set[str], dict[str, list[str]]]:
+    """Build the (universe, alias_map) used for tagging. Tagging ALWAYS runs
+    against the full investable universe (watchlist + holdings + discovery +
+    small-cap pools) plus the fundamentals-derived alias map — regardless of what
+    a caller passes — so a headline about a stock you don't own still gets tagged.
+    """
+    tag_universe = set(combined_universe(include_smallcaps=True, include_discovery=True,
+                                         include_extended=True))
+    if universe:
+        tag_universe |= set(universe)
+    return tag_universe, build_alias_map(tag_universe)
+
+
+def ingest(universe: list[str] | None = None) -> int:
+    tag_universe, alias_map = _tagging_context(universe)
     total = 0
     for name, url in FEEDS:
         try:
-            items = fetch_feed(name, url, watchlist)
+            items = fetch_feed(name, url, tag_universe, alias_map)
             n = insert_news(items)
             total += n
             console.print(f"  news: {name:>30} -> {len(items):>3} items ({n} new)")
@@ -261,7 +343,27 @@ def ingest(watchlist: list[str]) -> int:
     # avoids a circular dependency (news_scrape imports _match_tickers from here).
     try:
         from swingdesk.ingest import news_scrape
-        total += news_scrape.ingest(watchlist)
+        total += news_scrape.ingest(tag_universe, alias_map)
     except Exception as e:
         console.print(f"[red]news scrape stage failed: {e}[/red]")
     return total
+
+
+def retag_news(universe: list[str] | None = None) -> int:
+    """Re-run ticker tagging over ALL stored news and update their `tickers`
+    column. Run this after expanding the universe / alias logic (or after a fresh
+    fundamentals fetch) to surface past headlines that were ingested before a
+    stock was covered. Returns the number of rows whose tags changed.
+    """
+    from swingdesk.storage import load_all_news_for_retag, update_news_tickers
+    tag_universe, alias_map = _tagging_context(universe)
+    rows = load_all_news_for_retag()
+    if rows.empty:
+        return 0
+    updates = []
+    for _, r in rows.iterrows():
+        text = f"{r['title']} {r['summary'] or ''}"
+        new_tags = ",".join(_match_tickers(text, tag_universe, alias_map))
+        if new_tags != (r["tickers"] or ""):
+            updates.append({"id": int(r["id"]), "tickers": new_tags})
+    return update_news_tickers(updates)

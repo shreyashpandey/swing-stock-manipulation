@@ -237,6 +237,41 @@ CREATE TABLE IF NOT EXISTS plans (
     updated_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_plans_ticker ON plans(ticker);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key  TEXT NOT NULL UNIQUE,               -- order_id or hash(date,ticker,side,qty,price)
+    ticker      TEXT NOT NULL,
+    side        TEXT NOT NULL,                       -- buy | sell
+    qty         REAL NOT NULL,
+    price       REAL NOT NULL,
+    trade_date  TEXT NOT NULL,                       -- ISO yyyy-mm-dd
+    segment     TEXT DEFAULT 'delivery',             -- delivery | intraday
+    exchange    TEXT DEFAULT 'NSE',
+    charges     REAL,                                -- actual total charges if the export had them
+    source      TEXT DEFAULT 'groww',
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
+CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(trade_date);
+
+CREATE TABLE IF NOT EXISTS global_news (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    link          TEXT NOT NULL UNIQUE,
+    published     TEXT,
+    summary       TEXT,
+    cue           TEXT,
+    direction     TEXT,                       -- positive | negative | mixed | neutral
+    impact_score  REAL,                       -- 0-100 descriptive importance
+    sectors       TEXT,                       -- comma-joined affected Indian sectors
+    tickers       TEXT,                       -- comma-joined affected watchlist/fundamental tickers
+    rationale     TEXT,
+    fetched_at    TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_global_news_published ON global_news(published);
+CREATE INDEX IF NOT EXISTS idx_global_news_cue ON global_news(cue);
 """
 
 
@@ -386,6 +421,58 @@ def load_news(limit: int = 100, ticker: str | None = None) -> pd.DataFrame:
         return pd.read_sql_query(q, con, params=params)
 
 
+def insert_global_news(items: list[dict]) -> int:
+    """Insert global market/news cues mapped to Indian sectors/tickers."""
+    if not items:
+        return 0
+    cols = ["source", "title", "link", "published", "summary", "cue",
+            "direction", "impact_score", "sectors", "tickers", "rationale"]
+    rows = []
+    for it in items:
+        rows.append((
+            it.get("source"),
+            it.get("title"),
+            it.get("link"),
+            it.get("published"),
+            it.get("summary"),
+            it.get("cue"),
+            it.get("direction"),
+            it.get("impact_score"),
+            ",".join(it.get("sectors") or []),
+            ",".join(it.get("tickers") or []),
+            it.get("rationale"),
+        ))
+    with connect() as con:
+        cur = con.executemany(
+            "INSERT OR IGNORE INTO global_news "
+            f"({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
+            rows,
+        )
+        return cur.rowcount or 0
+
+
+def load_global_news(limit: int = 100, *, days: int | None = None,
+                     ticker: str | None = None,
+                     sector: str | None = None) -> pd.DataFrame:
+    """Load mapped global cues, optionally filtered by recency/ticker/sector."""
+    q = ("SELECT source,title,link,published,summary,cue,direction,impact_score,"
+         "sectors,tickers,rationale FROM global_news WHERE 1=1")
+    params: list = []
+    if days is not None:
+        q += " AND (published IS NULL OR published >= datetime('now', ?))"
+        params.append(f"-{int(days)} days")
+    if ticker:
+        q += " AND tickers LIKE ?"
+        params.append(f"%{ticker}%")
+    if sector:
+        q += " AND sectors LIKE ?"
+        params.append(f"%{sector}%")
+    q += " ORDER BY published DESC LIMIT ?"
+    params.append(limit)
+    with connect() as con:
+        return pd.read_sql_query(q, con, params=tuple(params))
+
+
 def load_unanalyzed_news(limit: int = 200) -> pd.DataFrame:
     """News rows that don't yet have sentiment, prioritizing items with ticker matches."""
     q = ("SELECT id, source, title, summary, tickers FROM news "
@@ -408,6 +495,36 @@ def update_news_sentiment(rows: list[dict]) -> int:
              for r in rows],
         )
     return len(rows)
+
+
+def load_all_news_for_retag() -> pd.DataFrame:
+    """All stored news (id, title, summary, tickers) — used by
+    news_rss.retag_news() to re-tag headlines after the universe/aliases change."""
+    with connect() as con:
+        return pd.read_sql_query("SELECT id, title, summary, tickers FROM news", con)
+
+
+def update_news_tickers(rows: list[dict]) -> int:
+    """Each row: {id, tickers}. Updates only the tickers column (re-tag backfill)."""
+    if not rows:
+        return 0
+    with connect() as con:
+        con.executemany(
+            "UPDATE news SET tickers=? WHERE id=?",
+            [(r["tickers"], r["id"]) for r in rows],
+        )
+    return len(rows)
+
+
+def recent_analyzed_news(limit: int = 2000) -> pd.DataFrame:
+    """Analyzed news with at least one tagged ticker, newest first — the input to
+    the news-catalyst scanner. Date filtering is done by the caller (published is
+    a mixed-timezone ISO string, so it's parsed in pandas, not SQL)."""
+    q = ("SELECT published, title, link, tickers, sentiment, impact, event_type "
+         "FROM news WHERE analyzed_at IS NOT NULL AND tickers != '' "
+         "ORDER BY published DESC LIMIT ?")
+    with connect() as con:
+        return pd.read_sql_query(q, con, params=(limit,))
 
 
 def insert_position(pos: dict) -> int:
@@ -668,14 +785,57 @@ def delete_plan(plan_id: int) -> None:
         con.execute("DELETE FROM plans WHERE id=?", (plan_id,))
 
 
+# ---- Imported broker trades (raw executions; kept separate from `positions`) ----
+# `positions` is the paper/real trade lifecycle the app manages; `trades` is the
+# immutable record of executions imported from a Groww tradebook, used only to
+# reconstruct realized P&L. Inserts are idempotent on `dedupe_key` so re-importing
+# the same export doesn't double-count.
+
+def upsert_trades(rows: list[dict], source: str = "groww") -> int:
+    """Insert executed trades, ignoring rows whose dedupe_key already exists.
+    Returns the count of NEW rows inserted."""
+    if not rows:
+        return 0
+    cols = ["dedupe_key", "ticker", "side", "qty", "price", "trade_date",
+            "segment", "exchange", "charges", "source"]
+    placeholders = ",".join(["?"] * len(cols))
+    inserted = 0
+    with connect() as con:
+        for r in rows:
+            r.setdefault("source", source)
+            cur = con.execute(
+                f"INSERT OR IGNORE INTO trades ({','.join(cols)}) VALUES ({placeholders})",
+                tuple(r.get(c) for c in cols))
+            inserted += cur.rowcount or 0
+    return inserted
+
+
+def load_trades(ticker: str | None = None) -> pd.DataFrame:
+    q = "SELECT ticker, side, qty, price, trade_date, segment, exchange, charges, source FROM trades"
+    params: tuple = ()
+    if ticker:
+        q += " WHERE ticker=?"
+        params = (ticker,)
+    q += " ORDER BY trade_date, id"
+    with connect() as con:
+        return pd.read_sql_query(q, con, params=params, parse_dates=["trade_date"])
+
+
+def clear_trades() -> int:
+    with connect() as con:
+        cur = con.execute("DELETE FROM trades")
+    return cur.rowcount or 0
+
+
 def combined_universe(include_smallcaps: bool = False,
-                      include_discovery: bool = False) -> list[str]:
+                      include_discovery: bool = False,
+                      include_extended: bool = False) -> list[str]:
     """Watchlist + holdings deduped — the full set of tickers we should
     keep prices/fundamentals/news data for.
 
-    Optionally include the curated small-cap or large/mid-cap discovery
-    universes — useful when running `news` or `sentiment` so headlines
-    mentioning those names get tagged properly.
+    Optionally include the curated small-cap, large/mid-cap discovery, or broad
+    extended (~Nifty-500) universes — useful when running `news`, `sentiment` or
+    the scanners so headlines/deals mentioning those names get tagged properly.
     """
     wl = get_watchlist()
     held = holdings_tickers()
@@ -687,6 +847,9 @@ def combined_universe(include_smallcaps: bool = False,
     if include_discovery:
         from swingdesk.analyze.discovery import DISCOVERY_UNIVERSE
         universe |= set(DISCOVERY_UNIVERSE)
+    if include_extended:
+        from swingdesk.analyze.universe import load_extended_universe
+        universe |= set(load_extended_universe())
     return sorted(universe)
 
 

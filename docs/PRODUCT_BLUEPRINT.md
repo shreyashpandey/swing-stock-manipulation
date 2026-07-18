@@ -368,7 +368,50 @@ This is what makes margins work and the app fast.
 
 ---
 
-## 10. References
+## 10. Platform decision — web first
+
+**Decision: web-first (responsive) + Telegram as the mobile bridge → native app later.**
+
+Why, for us specifically:
+- Code is already a Streamlit **web** app — zero rewrite; fastest path to the SEBI-safe beta.
+- Product is an analytics **workbench** (screeners, backtester, factor tables, charts) — desktop-strong,
+  like Tickertape/Screener/Trendlyne/Chartink. The mobile-first apps (Univest/Liquide) are *advice
+  feeds* — the Path-A product we are NOT building.
+- We already have `notify/telegram.py` → **Telegram alerts are our mobile presence** (scanner flags,
+  price moves, portfolio nudges) without building an app or waiting for app-store review.
+- Native app (or PWA) is **Phase 2**, funded by revenue, once web validates demand. Don't build mobile
+  on speculation.
+
+## 11. Go-to-market & launch
+
+**Launch sequence:** Waitlist page (this week) → private beta (~3 wk, 20–50 invited traders, free) →
+public free tier (~6 wk) → paid Pro (~2–3 mo, when data license + multi-tenancy + Razorpay ready;
+founder discount for first 100).
+
+**Marketing engine = the Unusual-Activity scanner.** Descriptive, shareable, competitor-proof content
+("here's the operator footprint we detected in XYZ"). It's the flywheel.
+
+**Channel priority (Indian retail swing traders):**
+1. X / FinTwit India — daily scanner finds, methodology threads, backtests (w/ hypothetical disclaimer).
+2. YouTube / Reels / Shorts — educational ("spot manipulation", "backtest a breakout") → funnel.
+3. Reddit — r/IndianStockMarket, r/IndianStreetBets — genuine value.
+4. SEO — "NSE breakout screener", "detect stock manipulation NSE", "backtest Indian stocks".
+5. Free **educational** Telegram channel (NOT a calls channel) → funnel + alert delivery + community.
+6. In-app referral (free month both sides).
+
+**Acquisition hook:** free, excellent **Groww-import portfolio tracker** → daily habit → scanner flags
+on the user's own holdings = natural Pro upsell.
+
+**Two hard rules (keep marketing on Path B):**
+- **Educate, never advise.** Teach a concept + show the tool. Never "we said buy and it ran +14%."
+- **Organic, not paid ads.** Google/Meta restrict financial-services ads in India (certification + extra
+  scrutiny). Organic/content is cheaper AND the only clean early path. Brand = **anti-tips-guru**:
+  "we show you the data, you make the call."
+
+**First 3 moves:** (1) ship a waitlist landing page this week; (2) start posting scanner finds on X now
+to build the audience pre-launch; (3) lock web-first + Telegram, shelve native app until paying users.
+
+## 12. References
 
 - smallcase — model & broker integration: https://www.smallcase.com/learn/what-is-smallcase/ ,
   who manages: https://tejimandi.com/blogs/unboxing-smallcases/who-manages-smallcase-role-of-sebi-ria-registered-investment-advisor

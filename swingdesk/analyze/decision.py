@@ -133,6 +133,8 @@ class Decision:
     manip_score: float | None
     liq_tier: str
     liq_score: float | None
+    float_turnover_pct: float | None   # % of free float traded/day (volume-vs-float)
+    amihud: float | None               # illiquidity: price impact per ₹ traded
     ml_prob_up: float | None
     # gates / narrative
     gates_passed: bool
@@ -145,6 +147,7 @@ class Decision:
     target: float | None
     rr: float | None
     level_source: str | None
+    setups: list[str]                  # fired entry setups (ema_20_50_cross, breakout_20d, …)
     # sizing / holding
     plan: PlanSizing | None
     holding: HoldingAdvice | None
@@ -163,9 +166,10 @@ def _insufficient(ticker: str, df) -> Decision:
         trend_verdict=None, expectancy_r=None, p_target_first=None, quality_score=None,
         sentiment_net=0, regime_label="n/a", sector_bias=None,
         manip_tier="n/a", manip_score=None, liq_tier="n/a", liq_score=None,
+        float_turnover_pct=None, amihud=None,
         ml_prob_up=None, gates_passed=False, veto_reason="insufficient history",
         pros=[], cons=[], entry=None, stoploss=None, target=None, rr=None,
-        level_source=None, plan=None, holding=None,
+        level_source=None, setups=[], plan=None, holding=None,
         data_gaps=[f"need ≥ 60 daily bars, have {n}"],
     )
 
@@ -216,6 +220,8 @@ def decide(ticker: str, *, planned_amount: float | None = None,
     liq = liq_mod.liquidity_profile(ticker, fund)
     liq_tier = liq.tier if liq else "n/a"
     liq_score = liq.score if liq else None
+    liq_float_turn = liq.float_turnover_pct if liq else None
+    liq_amihud = liq.amihud if liq else None
 
     # --- manipulation (veto candidate) ---
     manip = manip_mod.scorecard(ticker, df_raw, fund)
@@ -259,6 +265,7 @@ def decide(ticker: str, *, planned_amount: float | None = None,
 
     # --- trade levels: prefer a fresh setup, else derive from expected range ---
     sigs = scan_ticker(ticker)
+    setups = [s.get("setup") for s in sigs if s.get("setup")]   # all fired entry setups
     er = _safe(er_mod.expected_range, ticker)
     entry = stoploss = target = rr = None
     level_source = None
@@ -416,12 +423,14 @@ def decide(ticker: str, *, planned_amount: float | None = None,
         regime_label=regime_label, sector_bias=sector_bias,
         manip_tier=manip_tier, manip_score=manip_score,
         liq_tier=liq_tier, liq_score=liq_score,
+        float_turnover_pct=round(liq_float_turn, 3) if (liq_float_turn is not None and liq_float_turn == liq_float_turn) else None,
+        amihud=round(liq_amihud, 4) if (liq_amihud is not None and liq_amihud == liq_amihud) else None,
         ml_prob_up=round(ml_prob, 3) if (use_ml and ml_prob is not None) else None,
         gates_passed=gates_passed, veto_reason=veto_reason, pros=pros, cons=cons,
         entry=round(entry, 2) if entry else None,
         stoploss=round(stoploss, 2) if stoploss else None,
         target=round(target, 2) if target else None,
-        rr=rr, level_source=level_source,
+        rr=rr, level_source=level_source, setups=setups,
         plan=plan, holding=holding, data_gaps=data_gaps,
     )
 

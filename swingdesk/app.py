@@ -38,9 +38,14 @@ from swingdesk.analyze import risk as risk_mod
 from swingdesk.analyze import factors as factors_mod
 from swingdesk.analyze import ml_direction as ml_mod
 from swingdesk.analyze import intraday as intraday_mod
+from swingdesk.analyze import catalyst as catalyst_mod
+from swingdesk.analyze import global_impact as global_impact_mod
+from swingdesk.analyze import institutional as inst_mod
 from swingdesk.analyze import signal_analysis as sigan_mod
 from swingdesk.analyze import screener as screener_mod
+from swingdesk.analyze import sudden_move as sudden_move_mod
 from swingdesk.analyze import liquidity as liquidity_mod
+from swingdesk.analyze import market_flow as market_flow_mod
 from swingdesk.analyze import execution as execution_mod
 from swingdesk.analyze import tca as tca_mod
 from swingdesk.analyze import decision as decision_mod
@@ -63,13 +68,18 @@ from swingdesk.config import (
     RISK_PER_TRADE_PCT,
 )
 from swingdesk.ingest import fundamentals as fundamentals_ingest
+from swingdesk.ingest import global_news as global_news_ingest
 from swingdesk.ingest import macro as macro_ingest
 from swingdesk.ingest import news_rss, prices
 from swingdesk.ingest import intraday as intraday_ingest
 from swingdesk.notify import telegram
 from swingdesk.backtest import optimizer as opt
+from swingdesk.analyze import board as board_mod
+from swingdesk.analyze import charges as charges_mod
+from swingdesk.analyze import pnl_report as pnl_mod
 from swingdesk.portfolio import allocate as allocate_mod
 from swingdesk.portfolio import holdings as holdings_mod
+from swingdesk.portfolio import import_groww as import_groww_mod
 from swingdesk.portfolio import journal as pj
 from swingdesk.portfolio import positions as portfolio
 from swingdesk.portfolio import paper_trader as paper_trader_mod
@@ -82,6 +92,8 @@ from swingdesk.storage import (
     get_watchlist,
     holdings_tickers,
     load_holdings,
+    load_trades,
+    clear_trades,
     load_fundamentals as _load_fundamentals_raw,
     load_plans,
     upsert_plan,
@@ -154,7 +166,15 @@ def _clear_data_caches() -> None:
     _cached_risk_report.clear()
     _cached_portfolio_analysis.clear()
     _cached_manip_cards.clear()
+    _cached_sudden_radar.clear()
+    _cached_sudden_backtest.clear()
+    _cached_confluence_board.clear()
+    _cached_strategy_flow_backtest.clear()
+    _cached_explosive_backtest.clear()
+    _cached_global_impacts.clear()
     _cached_decisions.clear()
+    _cached_realized.clear()
+    _cached_board.clear()
     _cached_market_pulse.clear()
     _cached_price_coverage.clear()
 
@@ -350,6 +370,58 @@ def _cached_manip_cards(tickers: tuple):
     return cards
 
 
+@st.cache_data(ttl=900, show_spinner="Scanning news catalysts…")
+def _cached_catalysts(days: int, limit: int):
+    return catalyst_mod.scan_catalysts(days=days, limit=limit)
+
+
+@st.cache_data(ttl=900, show_spinner="Scoring sudden-move pressure…")
+def _cached_sudden_radar(tickers: tuple, intraday: bool, limit: int):
+    return sudden_move_mod.scan(list(tickers), include_intraday=intraday, limit=limit)
+
+
+@st.cache_data(ttl=1800, show_spinner="Backtesting sudden-move radar…")
+def _cached_sudden_backtest(tickers: tuple, min_score: float,
+                            move_threshold: float, horizon: int):
+    return sudden_move_mod.backtest(
+        list(tickers), min_score=min_score,
+        move_threshold_pct=move_threshold, horizon=horizon)
+
+
+@st.cache_data(ttl=900, show_spinner="Fusing radar, board, flow and risk…")
+def _cached_confluence_board(tickers: tuple, intraday: bool, limit: int, target_move: float):
+    return market_flow_mod.confluence_board(
+        list(tickers), include_intraday=intraday, limit=limit,
+        target_move_pct=target_move)
+
+
+@st.cache_data(ttl=1800, show_spinner="Backtesting strategies by market flow…")
+def _cached_strategy_flow_backtest(tickers: tuple, max_hold: int, min_trades: int):
+    return market_flow_mod.strategy_flow_backtest(
+        list(tickers), max_hold=max_hold, min_trades=min_trades)
+
+
+@st.cache_data(ttl=1800, show_spinner="Backtesting explosive-move candidates…")
+def _cached_explosive_backtest(tickers: tuple, target_move: float, min_score: float):
+    return market_flow_mod.explosive_move_backtest(
+        list(tickers), target_move_pct=target_move, min_explosive_score=min_score)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_global_impacts(days: int, limit: int):
+    return global_impact_mod.recent_impacts(days=days, limit=limit)
+
+
+@st.cache_data(ttl=900, show_spinner="Aggregating institutional flow…")
+def _cached_inst_flow(days: int, marquee: bool):
+    return inst_mod.recent_institutional_flow(days=days, only_marquee=marquee, limit=50)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_brokerage(days: int):
+    return inst_mod.brokerage_actions(days=days, limit=50)
+
+
 @st.cache_data(ttl=900, show_spinner="Fusing all signals into one verdict…")
 def _cached_decisions(tickers: tuple, capital: float, risk_pct: float,
                       run_mc: bool, use_ml: bool, plans_key: tuple):
@@ -359,6 +431,18 @@ def _cached_decisions(tickers: tuple, capital: float, risk_pct: float,
     return decision_mod.decide_universe(
         list(tickers), capital=capital, risk_pct=risk_pct,
         run_montecarlo=run_mc, use_ml=use_ml, plans=plans)
+
+
+@st.cache_data(ttl=900, show_spinner="Reconstructing round trips…")
+def _cached_realized(sig: int):
+    # `sig` (a hash of the trades table) only drives cache invalidation; the
+    # function reads the trades itself and FIFO-matches them into round trips.
+    return pnl_mod.realized_roundtrips()
+
+
+@st.cache_data(ttl=900, show_spinner="Building the board (fusing every signal)…")
+def _cached_board(tickers: tuple, fast: bool, top_us: int):
+    return board_mod.build_board(list(tickers), run_montecarlo=not fast, top_us=top_us)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -383,10 +467,10 @@ st.caption("Run the daily refresh from the sidebar. All data is stored locally i
 
 # --- Sidebar: actions + watchlist ----------------------------------------------
 PAGES = [
-    "My Holdings", "💸 Invest", "Discover", "Small Caps", "Signals", "Chart",
-    "News", "🔀 Sectors", "🚨 Manipulation", "📅 Calendar", "Backtest", "Optimize",
+    "My Holdings", "📒 P&L & Taxes", "💸 Invest", "Discover", "Small Caps", "Signals", "Chart",
+    "News", "🔀 Sectors", "🚨 Manipulation", "📡 Scanners", "📅 Calendar", "Backtest", "Optimize",
     "Portfolio", "Reconcile", "Fundamentals", "Raw data",
-    "🌐 Global", "📐 Range", "🛡 Risk", "🏆 Rank", "🔎 Screener", "🤖 ML", "⚡ Intraday",
+    "🌐 Global", "📐 Range", "🛡 Risk", "🏆 Rank", "🔎 Screener", "🧭 Board", "🤖 ML", "⚡ Intraday",
     "🛠 Execution", "📟 Paper Trader",
 ]
 
@@ -2226,6 +2310,296 @@ if _page == "🚨 Manipulation":
                         st.caption("Data gaps: " + " · ".join(c["data_gaps"]))
 
 
+# --- Scanners tab: news-catalyst + institutional flow ---------------------------
+if _page == "📡 Scanners":
+    st.subheader("📡 Scanners")
+    st.caption("Descriptive market scans — what's unusual or moving right now. "
+               "These are observations, not recommendations. Do your own research.")
+    _scanner = st.radio("Scanner", ["🧭 Confluence", "⚡ Sudden Move Radar", "🌍 Global Impact",
+                                    "📰 News Catalyst", "🏛 Institutional Flow"],
+                        horizontal=True, key="_scanner_pick")
+
+    if _scanner == "🧭 Confluence":
+        st.markdown("**Explosive Move Confluence** — stocks where the available "
+                    "evidence suggests a large one-day expansion is structurally "
+                    "possible. This is a watchlist and playbook, not a guarantee.")
+        flow = market_flow_mod.current_flow()
+        f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
+        f1.metric("Market flow", flow.flow)
+        f2.metric("Flow score", flow.score)
+        f3.metric("Volatility", flow.volatility)
+        f4.caption(flow.reason)
+
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        cf_limit = c1.slider("Max names", 5, 100, 30, key="_cf_limit")
+        cf_target = c2.select_slider("Target one-day move", options=[5.0, 8.0, 10.0, 12.0, 15.0],
+                                     value=10.0, key="_cf_target_move")
+        cf_intraday = c3.checkbox("Use intraday confirmation", key="_cf_intraday")
+        cf_scope = c4.radio("Universe", ["Watchlist + small caps", "Watchlist only"],
+                            key="_cf_scope")
+        cf_universe = combined_universe(
+            include_smallcaps=(cf_scope == "Watchlist + small caps"),
+            include_discovery=False)
+        conf = _cached_confluence_board(tuple(cf_universe), cf_intraday, cf_limit, cf_target)
+        if conf.empty:
+            st.info("No confluence rows yet. Run macro, prices and fundamentals first.")
+        else:
+            with st.expander("ℹ️ What do these columns mean?", expanded=False):
+                st.markdown(
+                    """
+                    - **explosive_score**: Overall score for a possible large one-day move. It blends history, live confirmation, setup pressure, market-flow fit and risk.
+                    - **hist_1d_hit_rate_pct**: How often this stock historically reached the selected target intraday, measured from previous close to day high.
+                    - **live_confirmation_score**: Today/live evidence score from catalyst, RVOL, breakout, VWAP, value spike, float turnover and liquidity.
+                    - **rvol**: Current/latest volume versus normal volume. Higher means unusual participation.
+                    - **order_value_mcap_pct**: Today's traded value as a percent of market cap. Shows how much money is rotating versus company size.
+                    - **order_value_spike_mult**: Today's traded value versus its recent normal traded value.
+                    - **volume_float_pct**: Today's volume as a percent of free float/shares. Higher means more tradable supply changed hands.
+                    - **liquidity_score / amihud**: Tradeability and price-impact measures. Low liquidity or high Amihud means fills/slippage can be dangerous.
+                    - **manip_tier**: Unusual-activity footprint. Elevated/High means inspect before trusting the move.
+                    - **entry_trigger / invalid_if**: The playbook condition to wait for, and the condition that cancels the setup.
+                    """
+                )
+            cols = ["ticker", "explosive_score", "target_move_pct", "hist_1d_hit_rate_pct",
+                    "max_1d_high_move_pct", "preferred_playbook", "market_flow",
+                    "live_confirmation_score", "breakout_confirmed", "vwap_hold", "rvol",
+                    "catalyst_score", "order_value_mcap_pct", "order_value_spike_mult",
+                    "volume_float_pct", "liquidity_tier", "liquidity_score", "amihud",
+                    "manip_tier", "entry_trigger", "invalid_if", "confluence_score",
+                    "radar_score", "strategy_fit", "risk_penalty",
+                    "why_10_15_possible", "risks"]
+            st.dataframe(
+                conf[cols],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "ticker": st.column_config.TextColumn("Ticker", help="NSE ticker symbol."),
+                    "explosive_score": st.column_config.NumberColumn(
+                        "Explosive score", help="0-100 score for possible selected one-day move. Higher means more evidence aligns."),
+                    "target_move_pct": st.column_config.NumberColumn(
+                        "Target %", help="The selected one-day intraday move target, e.g. 10% or 15%."),
+                    "hist_1d_hit_rate_pct": st.column_config.NumberColumn(
+                        "Hist hit %", help="Percent of recent sessions where day high reached the selected target from previous close."),
+                    "max_1d_high_move_pct": st.column_config.NumberColumn(
+                        "Max 1D high %", help="Largest recent previous-close to day-high move."),
+                    "preferred_playbook": st.column_config.TextColumn(
+                        "Playbook", help="Strategy family that best fits the stock/setup and current market flow."),
+                    "market_flow": st.column_config.TextColumn(
+                        "Market flow", help="Current broad tape: risk-on trend, steady uptrend, range/chop, volatile, or risk-off."),
+                    "live_confirmation_score": st.column_config.NumberColumn(
+                        "Live confirm", help="Score from live/today checks: catalyst, RVOL, breakout, VWAP hold, value spike, float turnover, liquidity."),
+                    "breakout_confirmed": st.column_config.CheckboxColumn(
+                        "Breakout", help="True when price has broken the relevant recent/prior high or intraday long condition."),
+                    "vwap_hold": st.column_config.CheckboxColumn(
+                        "VWAP hold", help="True when intraday price is holding above VWAP. Requires stored intraday bars."),
+                    "rvol": st.column_config.NumberColumn(
+                        "RVOL", help="Relative volume versus normal volume. 2x+ suggests unusual participation."),
+                    "catalyst_score": st.column_config.NumberColumn(
+                        "Catalyst", help="Recent news/global-impact pressure mapped to this stock."),
+                    "order_value_mcap_pct": st.column_config.NumberColumn(
+                        "Value/Mcap %", help="Today's traded value as a percent of market cap."),
+                    "order_value_spike_mult": st.column_config.NumberColumn(
+                        "Value spike x", help="Today's traded value versus recent normal traded value."),
+                    "volume_float_pct": st.column_config.NumberColumn(
+                        "Vol/float %", help="Today's volume as a percent of float/shares."),
+                    "liquidity_tier": st.column_config.TextColumn(
+                        "Liquidity", help="Tradeability tier: liquid, moderate, illiquid, untradeable."),
+                    "liquidity_score": st.column_config.NumberColumn(
+                        "Liq score", help="0-100 score for tradeability based on ADV, float turnover and turnover vs market cap."),
+                    "amihud": st.column_config.NumberColumn(
+                        "Amihud", help="Price impact per rupee traded. Higher means more illiquid/slippage-prone."),
+                    "manip_tier": st.column_config.TextColumn(
+                        "Manip tier", help="Unusual-activity footprint from turnover, float volume, abnormal return, delivery/deals where available."),
+                    "entry_trigger": st.column_config.TextColumn(
+                        "Entry trigger", help="Exact confirmation to wait for before treating the candidate as active."),
+                    "invalid_if": st.column_config.TextColumn(
+                        "Invalid if", help="Condition that cancels the setup."),
+                    "confluence_score": st.column_config.NumberColumn(
+                        "Confluence", help="Broad alignment score from radar, board conviction, gates, strategy fit and risk penalties."),
+                    "radar_score": st.column_config.NumberColumn(
+                        "Radar", help="Sudden Move Radar score from compression, accumulation, pre-breakout, relative strength and catalysts."),
+                    "strategy_fit": st.column_config.NumberColumn(
+                        "Strategy fit", help="How well this setup/playbook fits the current market flow."),
+                    "risk_penalty": st.column_config.NumberColumn(
+                        "Risk penalty", help="Points subtracted for manipulation risk, illiquidity or risk-off market."),
+                    "why_10_15_possible": st.column_config.TextColumn(
+                        "Why possible", help="Plain-English explanation for why the selected move target is or is not plausible."),
+                    "risks": st.column_config.TextColumn(
+                        "Risks", help="Main caution flags to inspect before acting."),
+                },
+            )
+
+        st.markdown("##### Does this explosive-move filter work historically?")
+        e1, e2, e3 = st.columns([1, 1, 1])
+        ex_min = e1.slider("Min explosive score", 40.0, 95.0, 70.0, 5.0, key="_ex_min_score")
+        if e2.button("Backtest explosive filter", key="_ex_bt_run"):
+            trades, summary = _cached_explosive_backtest(tuple(cf_universe), cf_target, ex_min)
+            st.json(summary)
+            if not trades.empty:
+                st.dataframe(trades.sort_values("explosive_score", ascending=False).head(100),
+                             width="stretch", hide_index=True)
+        e3.caption("Hit = next session high reaches the selected target move.")
+
+        st.markdown("##### Which strategies fit this market?")
+        b1, b2, b3 = st.columns([1, 1, 1])
+        sf_hold = b1.slider("Max hold", 5, 60, 20, key="_sf_hold")
+        sf_min = b2.slider("Min samples", 3, 30, 5, key="_sf_min")
+        if b3.button("Backtest by flow", key="_sf_run"):
+            stats, _ = _cached_strategy_flow_backtest(tuple(cf_universe), sf_hold, sf_min)
+            if stats.empty:
+                st.info("No strategy-flow stats yet. Run macro and fetch enough prices first.")
+            else:
+                st.dataframe(stats, width="stretch", hide_index=True)
+
+    elif _scanner == "⚡ Sudden Move Radar":
+        st.markdown("**Sudden Move Radar** — ranks stocks where compression, "
+                    "quiet accumulation, relative strength, float/liquidity, "
+                    "catalysts and optional intraday confirmation line up.")
+        c1, c2, c3 = st.columns([1, 1, 1])
+        sr_limit = c1.slider("Max names", 5, 100, 30, key="_sr_limit")
+        sr_intraday = c2.checkbox("Use intraday confirmation", key="_sr_intraday",
+                                  help="Requires stored 5m intraday bars.")
+        sr_scope = c3.radio("Universe", ["Watchlist + small caps", "Watchlist only"],
+                            horizontal=False, key="_sr_scope")
+        sr_universe = combined_universe(
+            include_smallcaps=(sr_scope == "Watchlist + small caps"),
+            include_discovery=False)
+        radar = _cached_sudden_radar(tuple(sr_universe), sr_intraday, sr_limit)
+        if radar.empty:
+            st.info("No radar rows yet. Fetch prices and fundamentals first.")
+        else:
+            show_cols = ["ticker", "radar_score", "readiness", "last",
+                         "compression", "accumulation", "prebreakout",
+                         "relative_strength", "catalyst", "intraday_confirm",
+                         "manip_penalty", "reasons", "risks"]
+            st.dataframe(radar[show_cols], width="stretch", hide_index=True)
+            st.caption("High score means setup pressure, not certainty. Use live price/volume "
+                       "confirmation before acting.")
+
+        st.markdown("##### Historical check")
+        b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
+        bt_score = b1.slider("Min score", 40.0, 90.0, 70.0, 5.0, key="_sr_bt_score")
+        bt_move = b2.slider("Move threshold %", 1.0, 8.0, 3.0, 0.5, key="_sr_bt_move")
+        bt_horizon = b3.slider("Horizon sessions", 1, 5, 1, key="_sr_bt_horizon")
+        run_bt = b4.button("Backtest radar", key="_sr_bt_run")
+        if run_bt:
+            trades, summary = _cached_sudden_backtest(
+                tuple(sr_universe), bt_score, bt_move, bt_horizon)
+            st.json(summary)
+            if not trades.empty:
+                st.dataframe(trades.sort_values("radar_score", ascending=False).head(100),
+                             width="stretch", hide_index=True)
+
+    elif _scanner == "🌍 Global Impact":
+        st.markdown("**Global Impact Radar** — curated world-market cues mapped "
+                    "to Indian sectors and known tickers.")
+        g1, g2, g3 = st.columns([1, 1, 1])
+        g_days = g1.slider("Lookback (days)", 1, 14, 3, key="_glob_news_days")
+        g_limit = g2.slider("Rows", 10, 100, 40, key="_glob_news_limit")
+        if g3.button("Fetch global news", key="_fetch_global_news"):
+            with st.spinner("Fetching global market feeds…"):
+                n = global_news_ingest.ingest(per_feed=40)
+            _cached_global_impacts.clear()
+            _cached_sudden_radar.clear()
+            st.success(f"{n} new mapped item(s)")
+        impacts = _cached_global_impacts(g_days, g_limit)
+        if impacts.empty:
+            st.info("No mapped global cues yet. Click **Fetch global news**.")
+        else:
+            cols = ["published", "source", "cue", "direction", "impact_score",
+                    "sectors", "tickers", "title"]
+            st.dataframe(impacts[cols], width="stretch", hide_index=True)
+
+    elif _scanner == "📰 News Catalyst":
+        st.markdown("**News-driven movers** — stocks where recent news pressure is "
+                    "backed by a price/volume reaction. Surfaces ideas **outside** your "
+                    "watchlist too (🆕) — the news-first view discovery can't give you.")
+        c1, c2 = st.columns(2)
+        cat_days = c1.slider("Lookback (days)", 1, 14, 3, key="_cat_days")
+        cat_limit = c2.slider("Max names", 5, 60, 25, key="_cat_limit")
+        hits = _cached_catalysts(cat_days, cat_limit)
+        if not hits:
+            st.info("No catalysts yet. Use the sidebar to **Fetch news** + "
+                    "**Analyze news (Claude)** first.")
+        else:
+            arrow = {"bullish": "🟢 ▲", "bearish": "🔴 ▼", "mixed": "🟡 ◆"}
+            rows = [{
+                "Dir": arrow.get(h.direction, "◆"),
+                "Ticker": h.ticker,
+                "Strength": h.strength,
+                "News ↑/↓": f"{h.bullish}/{h.bearish}",
+                "Hi-impact": h.high_impact,
+                f"{cat_days}d move": f"{h.ret_pct:+.1f}%" if h.ret_pct is not None else "—",
+                "RVOL": f"{h.rvol:.1f}x" if h.rvol is not None else "—",
+                "Event": h.top_event or "",
+                "Idea": "🆕 new" if not h.in_universe else "",
+            } for h in hits]
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            with st.expander("Top catalyst headlines"):
+                for h in hits[:15]:
+                    if h.top_headline:
+                        head = (f"[{h.top_headline}]({h.top_link})"
+                                if h.top_link else h.top_headline)
+                        st.markdown(f"**{h.ticker}** — {head}")
+
+    elif _scanner == "🏛 Institutional Flow":
+        st.markdown("**Smart-money tape** — named buyers/sellers from disclosed "
+                    "**bulk & block deals**, plus sell-side **brokerage calls**. "
+                    "Disclosed/published data only — and remember to follow long-only "
+                    "accumulators, not prop/market-makers.")
+        c1, c2, c3 = st.columns([1, 1, 1])
+        inst_days = c1.slider("Lookback (days)", 7, 90, 30, key="_inst_days")
+        inst_marquee = c2.checkbox(
+            "Marquee only", key="_inst_marquee",
+            help="Only stocks with BlackRock / Morgan Stanley / JPMorgan / Jefferies / GIC / a big MF on the tape")
+        if c3.button("Fetch latest deals", help="Pull today's bulk/block deals market-wide"):
+            from swingdesk.ingest import nse as _nse
+            with st.spinner("Fetching NSE bulk/block deals…"):
+                _nse.ingest_deals(None)
+            _cached_inst_flow.clear()
+            st.success("deals updated")
+
+        flows = _cached_inst_flow(inst_days, inst_marquee)
+        st.markdown("##### Deal flow (bulk + block)")
+        st.caption("**Stock** = the company traded · **Buyers/Sellers** = the named "
+                   "parties on the deal tape (mostly prop/HFT desks — marquee long-only "
+                   "funds rarely cross the bulk-deal threshold; see note below).")
+        if not flows:
+            st.info("No deals stored. Click **Fetch latest deals** above "
+                    "(or run `swingdesk nse --all-deals`).")
+        else:
+            def _names(flow, want_buy):
+                seen = [c.title() for c, s in flow.clients
+                        if (s.startswith("B") if want_buy else s.startswith("S"))]
+                uniq = list(dict.fromkeys(seen))               # dedupe, keep order
+                return ", ".join(uniq[:4]) + (" …" if len(uniq) > 4 else "")
+            st.dataframe(pd.DataFrame([{
+                "Stock": f.ticker,
+                "Company": f.security or "",
+                "Net": f.net_side,
+                "₹cr": round(f.net_value / 1e7, 2) if f.net_value else 0.0,
+                "Buyers": _names(f, True),
+                "Sellers": _names(f, False),
+                "Marquee": " · ".join(f.marquee),
+            } for f in flows]), width="stretch", hide_index=True)
+
+        st.markdown("##### Brokerage calls (sell-side desks)")
+        actions = _cached_brokerage(inst_days)
+        if not actions:
+            st.caption("No brokerage stock-calls detected in recent headlines. "
+                       "(A broker named in macro commentary — e.g. 'Goldman on oil' — "
+                       "isn't counted; only stock buy/sell/target calls are.)")
+        else:
+            for a in actions:
+                dot = "🟢" if a.sentiment == "bullish" else "🔴"
+                tk = f"`{a.ticker}` · " if a.ticker else ""
+                head = f"[{a.headline}]({a.link})" if a.link else a.headline
+                st.markdown(f"{dot} **{a.broker}** · _{a.action.lower()}_ · {tk}{head}")
+
+    st.caption("ℹ️ Related scanners: Unusual-Activity lives under **🚨 Manipulation**, "
+               "Expected Range under **📐 Range** — these get unified here in the full "
+               "section reorg.")
+
+
 # --- Calendar tab ---------------------------------------------------------------
 if _page == "📅 Calendar":
     from datetime import date as _date, timedelta
@@ -2690,6 +3064,248 @@ if _page == "My Holdings":
             ])
             if not sect_df.empty:
                 st.dataframe(sect_df, width="stretch", hide_index=True)
+
+
+# --- P&L & Taxes tab ------------------------------------------------------------
+if _page == "📒 P&L & Taxes":
+    import tempfile
+
+    st.subheader("📒 P&L & Taxes — your real, after-cost numbers")
+    st.caption(
+        "Upload your Groww documents to see: what you hold and the **net P&L if "
+        "you exit today** (after charges), which holdings to **exit within ~2 "
+        "months**, and **what your swing trading has actually earned** net of "
+        "brokerage + STT + exchange + GST + stamp duty + DP charges. Charges are "
+        "modelled from Groww's rate card and are **indicative** — verify against "
+        "your contract notes. Not tax advice."
+    )
+
+    def _save_upload(uploaded) -> str:
+        suffix = "." + uploaded.name.rsplit(".", 1)[-1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded.getvalue())
+            return tmp.name
+
+    def _overrides(text: str) -> dict:
+        out = {}
+        for kv in (text or "").split(","):
+            k, _, v = kv.partition("=")
+            if k.strip() and v.strip():
+                out[k.strip()] = v.strip()
+        return out
+
+    # ---- Upload area --------------------------------------------------------
+    with st.expander("📤 Upload Groww documents", expanded=load_holdings().empty):
+        uc1, uc2, uc3 = st.columns(3)
+        with uc1:
+            st.markdown("**Holdings** — current portfolio")
+            h_file = st.file_uploader("Holdings CSV/XLSX", type=["csv", "xlsx", "xls"], key="pnl_h")
+            h_map = st.text_input("Overrides", key="pnl_hm", placeholder="symbol=Stock,avg_price=Avg")
+            if h_file and st.button("Import holdings", key="pnl_hb", width="stretch"):
+                try:
+                    n = holdings_mod.import_csv(_save_upload(h_file), overrides=_overrides(h_map))
+                    _clear_data_caches()
+                    st.success(f"Imported {n} holdings")
+                except Exception as e:
+                    st.error(f"Holdings import failed: {e}")
+        with uc2:
+            st.markdown("**Tradebook** — order history")
+            t_file = st.file_uploader("Tradebook CSV", type=["csv", "xlsx", "xls"], key="pnl_t")
+            t_map = st.text_input("Overrides", key="pnl_tm", placeholder="symbol=Stock,side=Type,date=Trade Date")
+            if t_file and st.button("Import tradebook", key="pnl_tb", width="stretch"):
+                try:
+                    res = import_groww_mod.import_tradebook(_save_upload(t_file), overrides=_overrides(t_map))
+                    _clear_data_caches()
+                    st.success(f"Parsed {res['rows']} trades · {res['new']} new")
+                except Exception as e:
+                    st.error(f"Tradebook import failed: {e}")
+        with uc3:
+            st.markdown("**Tax P&L** — capital gains")
+            x_file = st.file_uploader("Tax P&L CSV", type=["csv", "xlsx", "xls"], key="pnl_x")
+            x_map = st.text_input("Overrides", key="pnl_xm", placeholder="symbol=Stock,buy_date=Buy Date")
+            if x_file and st.button("Load Tax P&L", key="pnl_xb", width="stretch"):
+                try:
+                    df = import_groww_mod.parse_tax_pnl(_save_upload(x_file), overrides=_overrides(x_map))
+                    st.session_state["pnl_taxpnl"] = df
+                    _clear_data_caches()
+                    st.success(f"Loaded {len(df)} matched round trips from Tax P&L")
+                except Exception as e:
+                    st.error(f"Tax P&L parse failed: {e}")
+
+        _trades_df = load_trades()
+        _tax_df = st.session_state.get("pnl_taxpnl")
+        bits = [f"{len(load_holdings())} holdings", f"{len(_trades_df)} trades"]
+        if _tax_df is not None:
+            bits.append(f"Tax P&L: {len(_tax_df)} round trips")
+        st.caption("On record: " + " · ".join(bits))
+        if len(_trades_df) and st.button("🗑 Clear imported trades", key="pnl_clear"):
+            clear_trades()
+            _clear_data_caches()
+            st.rerun()
+
+    # ---- Section 1: Snapshot — net if exited today --------------------------
+    holds = load_holdings()
+    st.markdown("### 1 · Holdings — net P&L if you exit today")
+    if holds.empty:
+        st.info("Upload your **Holdings** export above to see current P&L.")
+    else:
+        snap_rows, t_inv, t_val, t_gross, t_exit = [], 0.0, 0.0, 0.0, 0.0
+        for r in holds.to_dict("records"):
+            tk, qty = r["ticker"], float(r.get("qty") or 0)
+            avg = float(r.get("avg_price") or 0)
+            last = float(r.get("last_price") or 0)
+            if last <= 0:
+                px = load_prices(tk, days=5)
+                last = float(px["close"].iloc[-1]) if not px.empty else avg
+            invested = qty * avg
+            cur_val = qty * last
+            gross = cur_val - invested
+            exitc = charges_mod.exit_charges(last, qty)["total"] if qty else 0.0
+            net = gross - exitc
+            t_inv += invested; t_val += cur_val; t_gross += gross; t_exit += exitc
+            snap_rows.append({
+                "Ticker": tk, "Qty": qty, "Avg ₹": round(avg, 1), "LTP ₹": round(last, 1),
+                "Invested ₹": round(invested), "Value ₹": round(cur_val),
+                "Gross P&L ₹": round(gross), "Exit cost ₹": round(exitc),
+                "Net if exit ₹": round(net),
+                "Net %": round(net / invested * 100, 1) if invested else 0.0,
+            })
+        m = st.columns(5)
+        m[0].metric("Invested", f"₹{t_inv:,.0f}")
+        m[1].metric("Current value", f"₹{t_val:,.0f}")
+        m[2].metric("Gross unrealized", f"₹{t_gross:,.0f}", f"{t_gross/t_inv*100:+.1f}%" if t_inv else None)
+        m[3].metric("Cost to exit all", f"₹{t_exit:,.0f}")
+        m[4].metric("Net if exit today", f"₹{t_gross - t_exit:,.0f}",
+                    f"{(t_gross - t_exit)/t_inv*100:+.1f}%" if t_inv else None)
+        st.dataframe(pd.DataFrame(snap_rows), width="stretch", hide_index=True)
+
+    # ---- Section 2: Exit within ~2 months -----------------------------------
+    st.markdown("### 2 · Exit within ~2 months")
+    if holds.empty:
+        st.caption("Upload holdings to get exit recommendations.")
+    else:
+        # Approx acquisition date per ticker = earliest buy in the tradebook (for the LTCG nudge).
+        acq = {}
+        if not _trades_df.empty:
+            buys = _trades_df[_trades_df["side"].str.lower() == "buy"]
+            if not buys.empty:
+                acq = buys.groupby("ticker")["trade_date"].min().to_dict()
+        try:
+            decisions = _cached_decisions(tuple(sorted(holdings_tickers())),
+                                          float(ACCOUNT_CAPITAL), float(RISK_PER_TRADE_PCT),
+                                          False, False, ())
+        except Exception as e:
+            decisions = []
+            st.warning(f"Couldn't score holdings: {e}")
+        exit_rows = []
+        for d in decisions:
+            h = d.holding
+            if h is None or h.action not in ("EXIT", "TRIM"):
+                continue
+            nudge = ""
+            ad = acq.get(d.ticker)
+            if ad is not None and h.unrealized_pct > 0:
+                days_held = (pd.Timestamp.now().normalize() - pd.Timestamp(ad)).days
+                to_ltcg = 365 - days_held
+                if 0 < to_ltcg <= 45:
+                    nudge = f"⏳ {to_ltcg}d to LTCG (12.5% vs 20% STCG) — consider holding"
+            exit_rows.append({
+                "Ticker": d.ticker, "Advice": h.action, "Unreal %": h.unrealized_pct,
+                "Conviction": d.conviction, "Manip": d.manip_tier,
+                "Why": h.reason, "Tax note": nudge,
+            })
+        if exit_rows:
+            st.dataframe(pd.DataFrame(exit_rows), width="stretch", hide_index=True)
+            st.caption("EXIT/TRIM from the unified decision engine (trend, money-flow, "
+                       "manipulation veto). The tax note flags lots near the 1-year LTCG line.")
+        else:
+            st.success("No holdings flagged for exit right now — engine says hold.")
+
+    # ---- Section 3: Realized swing-trading earnings -------------------------
+    st.markdown("### 3 · What your swing trading earned (realized, net of charges)")
+    if _tax_df is not None and not _tax_df.empty:
+        rt = pnl_mod.realized_roundtrips(tax_pnl_df=_tax_df)
+        src = "Tax P&L (Groww-matched)"
+    elif not _trades_df.empty:
+        sig = int(pd.util.hash_pandas_object(_trades_df, index=False).sum())
+        rt = _cached_realized(sig)
+        src = "tradebook (FIFO-matched)"
+    else:
+        rt = pd.DataFrame()
+        src = None
+
+    if rt.empty:
+        st.info("Upload a **Tradebook** or **Tax P&L** export to see realized P&L.")
+    else:
+        st.caption(f"Source: {src} · {len(rt)} round trips")
+        swing = pnl_mod.performance(rt, bucket="swing")
+        if swing.get("n_trades", 0) == 0:
+            st.warning("No trades fell in the swing bucket (1–40 days). Showing all realized below.")
+            swing = pnl_mod.performance(rt, bucket=None)
+        s = st.columns(4)
+        s[0].metric("Net earned (swing)", f"₹{swing['net_pnl']:,.0f}")
+        s[1].metric("Win rate", f"{swing['win_rate']:.0f}%", f"{swing['n_trades']} trades")
+        s[2].metric("Profit factor", f"{swing['profit_factor']:.2f}" if swing.get("profit_factor") else "—")
+        s[3].metric("Expectancy / trade", f"₹{swing['expectancy']:,.0f}")
+        s2 = st.columns(4)
+        s2[0].metric("Avg hold (days)", f"{swing['avg_holding_days']:.0f}")
+        s2[1].metric("Charges paid", f"₹{swing['total_charges']:,.0f}",
+                     f"{swing['charges_pct_of_gross']:.0f}% of gross" if swing.get("charges_pct_of_gross") else None)
+        s2[2].metric("Cost drag", f"{swing['charges_pct_of_turnover']:.2f}% of turnover")
+        tax = swing["tax"]
+        s2[3].metric("Est. tax", f"₹{tax['total_tax']:,.0f}",
+                     f"STCG ₹{tax['stcg_tax']:,.0f} + LTCG ₹{tax['ltcg_tax']:,.0f}")
+
+        if swing.get("best") and swing.get("worst"):
+            st.caption(f"Best: {swing['best']['ticker']} ₹{swing['best']['net_pnl']:,.0f}  ·  "
+                       f"Worst: {swing['worst']['ticker']} ₹{swing['worst']['net_pnl']:,.0f}")
+
+        by_month = swing.get("by_month")
+        if by_month is not None and len(by_month):
+            st.markdown("**Net realized P&L by month**")
+            st.bar_chart(by_month)
+
+        # Bucket breakdown so intraday/positional don't muddy the swing read.
+        brk = []
+        for b in ("intraday", "swing", "positional", "long_term"):
+            p = pnl_mod.performance(rt, bucket=b)
+            if p.get("n_trades", 0):
+                brk.append({"Bucket": b, "Trades": p["n_trades"], "Win %": p["win_rate"],
+                            "Net ₹": round(p["net_pnl"]), "Charges ₹": round(p["total_charges"])})
+        if brk:
+            st.markdown("**By holding-period bucket**")
+            st.dataframe(pd.DataFrame(brk), width="stretch", hide_index=True)
+
+        # Rough benchmark comparison.
+        bm = pnl_mod.benchmark_alpha(rt)
+        if bm and bm.get("benchmark_return_pct") is not None:
+            st.caption(
+                f"Return on capital deployed ≈ {bm['realized_return_pct']:+.1f}% vs "
+                f"NIFTY {bm['benchmark_return_pct']:+.1f}% over the same window → "
+                f"**{bm['alpha_pct']:+.1f}% alpha** (rough — capital is recycled across "
+                "trades, so not time-weighted)."
+            )
+
+        # ---- Section 4: Charges breakdown -----------------------------------
+        st.markdown("### 4 · Where the charges went (all realized trades)")
+        agg = charges_mod.merge_charges(*[
+            charges_mod.round_trip_charges(r["buy_price"], r["sell_price"], r["qty"],
+                                           segment=r.get("segment") or "delivery",
+                                           exchange=r.get("exchange") or "NSE")
+            for r in rt.to_dict("records")
+        ]) if len(rt) else {}
+        if agg:
+            label = {"brokerage": "Brokerage", "stt": "STT", "exchange_txn": "Exchange txn",
+                     "sebi": "SEBI fee", "stamp_duty": "Stamp duty", "gst": "GST",
+                     "dp_charge": "DP charges", "total": "Total"}
+            st.dataframe(pd.DataFrame(
+                [{"Charge": label[k], "₹": round(agg[k])} for k in charges_mod.CHARGE_KEYS]),
+                width="stretch", hide_index=True)
+            st.caption("Modelled from Groww's rate card across all round trips. If your "
+                       "Tax P&L carried real charge figures, those drive the net P&L above.")
+
+    st.warning("⚠ Indicative — modelled charges and tax (STCG 20% / LTCG 12.5% above ₹1.25L) "
+               "are estimates, not tax advice. Verify against your Groww contract notes / CA.")
 
 
 # --- Optimize tab ---------------------------------------------------------------
@@ -3675,6 +4291,123 @@ if _page == "🔎 Screener":
                                      expanded=bool(i.get("supported"))):
                         for h in heads:
                             st.markdown(f"- {h}")
+
+# --- 🧭 Board (fused, colour-coded ranking with US/global context) --------------
+if _page == "🧭 Board":
+    st.subheader("🧭 Board — every signal fused into one ranked, colour-coded view")
+    st.caption(
+        "Technicals + manipulation + liquidity (volume-vs-float, Amihud) + factor "
+        "rank + news + **US/global signals** (NASDAQ-overnight / USD-INR / Brent "
+        "betas, risk regime, next-day spillover). Each row is **coloured by what "
+        "makes it interesting**; the **tags** column couples the signals together. "
+        "The top table is names that satisfy *all* the factors."
+    )
+
+    bc1, bc2, bc3 = st.columns([1.6, 1, 1])
+    with bc1:
+        b_scope = st.radio("Universe",
+                           ["Watchlist + holdings + small caps", "Watchlist + holdings"],
+                           key="board_scope")
+    with bc2:
+        b_fast = st.checkbox("Fast mode", value=True,
+                             help="Skip Monte-Carlo target/stop odds — much faster. "
+                                  "Turn off to add expectancy to the strict gate.")
+    with bc3:
+        st.write("")
+        if st.button("🔄 Re-run", width="stretch", key="board_rerun"):
+            _cached_board.clear()
+            st.rerun()
+
+    b_univ = (combined_universe(include_smallcaps=True)
+              if b_scope.endswith("small caps") else combined_universe())
+
+    # ---- Global context banner ----
+    reg = _cached_regime()
+    out = _cached_outlook()
+    pulse = _cached_market_pulse() or {}
+    REG_BADGE = {"risk-on": "🟢 RISK-ON", "neutral": "⚪ NEUTRAL", "risk-off": "🔴 RISK-OFF"}
+    gc1, gc2 = st.columns([1, 2])
+    with gc1:
+        if reg:
+            st.metric("Market regime", REG_BADGE.get(reg.label, reg.label), f"score {reg.score:+d}")
+        if out:
+            st.caption(f"Next-day: {out.driver} → NIFTY **{out.expected_pct:+.2f}%** "
+                       f"({out.low_pct:+.2f}…{out.high_pct:+.2f}%, {out.confidence} confidence)")
+    with gc2:
+        if pulse:
+            order = ["S&P 500", "NASDAQ", "Dow Jones", "INDIA VIX", "USD/INR", "Brent Crude"]
+            cols = st.columns(len([k for k in order if k in pulse]) or 1)
+            for col, name in zip(cols, [k for k in order if k in pulse]):
+                p = pulse[name]
+                col.metric(name, f"{p['close']:,.1f}", f"{p['chg_1d']:+.2f}% (1d)")
+        else:
+            st.caption("💡 Run `cli macro` (or the macro refresh) for US/global context.")
+
+    if not b_univ:
+        st.info("No tickers in this universe — add to your watchlist or import holdings.")
+    else:
+        df = _cached_board(tuple(sorted(b_univ)), b_fast, 40)
+        if df.empty:
+            st.info("Couldn't build the board — fetch prices/fundamentals first.")
+        else:
+            def _row_color(row):
+                css = board_mod.CATEGORY_COLOR.get(row.get("category"), "")
+                return [f"background-color: {css}" if css else ""] * len(row)
+
+            _badge = {"STRONG_BUY": "🟢🟢 STRONG BUY", "BUY": "🟢 BUY", "ACCUMULATE": "🔵 ACCUMULATE",
+                      "WAIT": "🟡 WAIT", "AVOID": "🔴 AVOID"}
+            _colcfg = {
+                "conviction": st.column_config.ProgressColumn("Conv", min_value=0, max_value=100, format="%d"),
+                "turn_today_pct": st.column_config.NumberColumn("Turn today %", format="%.3f"),
+                "turn_avg_pct": st.column_config.NumberColumn("Turn avg %", format="%.3f"),
+                "today_x_avg": st.column_config.NumberColumn("today×avg", format="%.1f×"),
+                "float_turnover_pct": st.column_config.NumberColumn("Vol/float %", format="%.2f"),
+                "amihud": st.column_config.NumberColumn("Amihud", format="%.3f"),
+                "nasdaq_beta": st.column_config.NumberColumn("NASDAQ β", format="%.2f"),
+                "sentiment_net": st.column_config.NumberColumn("News net"),
+                "setups": st.column_config.TextColumn("Setups (signals)",
+                          help="Fresh entry setups firing now — EMA 20/50 cross, breakout, MACD, "
+                               "Supertrend flip, etc. (the same detectors the Signals tab runs)."),
+                "entry": st.column_config.NumberColumn(format="₹%.1f"),
+                "stoploss": st.column_config.NumberColumn(format="₹%.1f"),
+                "target": st.column_config.NumberColumn(format="₹%.1f"),
+            }
+
+            def _render(frame, cols):
+                disp = frame.copy()
+                disp["action"] = disp["action"].map(lambda a: _badge.get(a, a))
+                disp = disp[[c for c in cols if c in disp.columns]]
+                st.dataframe(disp.style.apply(_row_color, axis=1),
+                             width="stretch", hide_index=True, column_config=_colcfg)
+
+            # ---- Top picks: satisfies all factors ----
+            picks = board_mod.top_picks(df, n=20)
+            n_strict = int((picks["pick"] == "strict").sum()) if not picks.empty else 0
+            st.markdown(f"### ✅ Satisfies all factors — top {len(picks)} "
+                        f"({n_strict} strict" + (f" + {len(picks)-n_strict} near-miss fill)" if len(picks) > n_strict else ")"))
+            if picks.empty:
+                st.info("No names clear the bar right now — see the full board below.")
+            else:
+                _render(picks, ["pick", "ticker", "category", "tags", "action", "conviction",
+                                "setups", "sentiment_net", "today_x_avg", "turn_today_pct", "liq_tier",
+                                "nasdaq_beta", "entry", "stoploss", "target", "rr"])
+
+            # ---- Full ranked board ----
+            st.markdown(f"### Full board — {len(df)} stocks, ranked by conviction")
+            _render(df, ["ticker", "category", "tags", "action", "conviction", "setups",
+                         "turn_today_pct", "turn_avg_pct", "today_x_avg", "liq_tier",
+                         "float_turnover_pct", "amihud", "manip_tier", "factor_quintile",
+                         "tech_tilt", "trend_verdict", "nasdaq_beta", "us_read"])
+
+            st.caption(
+                "**Colour legend** — 🟢 News-backed · 🔵 Turnover-vs-mcap surge · "
+                "🟣 US/global tailwind · 🟦 Factor leader · 🟠 Illiquid (size down) · "
+                "🔴 Manipulation risk (risk flags override the colour; *tags* still "
+                "show the positives). Per-stock US betas computed for the top 40 by conviction."
+            )
+            st.warning("⚠ Signals, not advice. Fast mode skips the Monte-Carlo odds — "
+                       "turn it off to fold expectancy into the strict gate.")
+
 
 # --- 🛠 Execution (execution algos + TCA = how to get in/out, and how you did) --
 if _page == "🛠 Execution":

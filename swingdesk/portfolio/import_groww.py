@@ -18,12 +18,13 @@ The importer matches buy/sell pairs by FIFO per ticker:
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pandas as pd
 from rich.console import Console
 
-from swingdesk.storage import insert_position, update_position
+from swingdesk.storage import insert_position, update_position, upsert_trades
 
 console = Console()
 
@@ -35,8 +36,36 @@ COLUMN_ALIASES = {
     "qty":      ["qty", "quantity", "shares", "qty.", "no. of shares"],
     "price":    ["price", "avg price", "average price", "rate", "trade price"],
     "date":     ["date", "trade date", "executed at", "order date", "timestamp"],
-    "exchange": ["exchange", "segment", "venue"],
+    "exchange": ["exchange", "venue", "exchange name"],
+    # Optional — picked up only if present.
+    "segment":  ["product", "product type", "producttype", "order type", "ordertype"],
+    "charges":  ["charges", "total charges", "taxes & charges", "taxes and charges",
+                 "brokerage & charges", "total taxes"],
+    "order_id": ["order id", "order no", "order_id", "trade id", "tradeid"],
 }
+
+
+def _norm_symbol(sym: str) -> str:
+    """Use holdings.py's robust normaliser (TICKER_CORRECTIONS + name lookup) so
+    imported tickers match the rest of the app; fall back to the simple form."""
+    try:
+        from swingdesk.portfolio.holdings import _normalize_symbol as _h
+        return _h(sym)
+    except Exception:
+        return _normalize_symbol(sym)
+
+
+def _norm_segment(val) -> str:
+    """Map a broker product/segment code to 'delivery' | 'intraday'."""
+    s = str(val or "").upper()
+    if any(t in s for t in ("MIS", "INTRADAY", "INTRA")):
+        return "intraday"
+    return "delivery"   # CNC / DELIVERY / NRML / blank → delivery (the swing default)
+
+
+def _dedupe_key(date_s: str, ticker: str, side: str, qty: float, price: float) -> str:
+    raw = f"{date_s}|{ticker}|{side}|{qty}|{price}"
+    return hashlib.sha1(raw.encode()).hexdigest()
 
 
 def _normalize_columns(df: pd.DataFrame, overrides: dict[str, str] | None = None) -> pd.DataFrame:
@@ -78,8 +107,10 @@ def parse_csv(path: str | Path, overrides: dict[str, str] | None = None) -> pd.D
             f"missing required columns: {missing}. "
             f"Found: {list(df.columns)}. Use --map to override (e.g. --map symbol=Stock)."
         )
-    df["symbol"] = df["symbol"].apply(_normalize_symbol)
-    df["side"] = df["side"].astype(str).str.lower().str.strip()
+    df["symbol"] = df["symbol"].apply(_norm_symbol)
+    # 'B'/'BUY'/'Buy' → buy, 'S'/'SELL' → sell.
+    df["side"] = df["side"].astype(str).str.lower().str.strip().map(
+        lambda v: "buy" if v in ("b", "buy") else "sell" if v in ("s", "sell") else v)
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").astype("Int64")
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     # Try ISO first (YYYY-MM-DD), fall back to dayfirst for DD/MM/YYYY.
@@ -87,6 +118,10 @@ def parse_csv(path: str | Path, overrides: dict[str, str] | None = None) -> pd.D
     if parsed.isna().any():
         parsed = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     df["date"] = parsed
+    # Optional columns (only coerce if the export carried them).
+    if "charges" in df.columns:
+        df["charges"] = (df["charges"].astype(str).str.replace(r"[₹,]", "", regex=True)
+                         .pipe(pd.to_numeric, errors="coerce"))
     df = df.dropna(subset=["symbol", "side", "qty", "price", "date"])
     df = df.sort_values("date").reset_index(drop=True)
     return df
@@ -191,3 +226,103 @@ def import_trades(path: str | Path, *, overrides: dict[str, str] | None = None,
                 )
 
     return {"buys": buys, "sells": sells, "matched": matched, "opened": opened}
+
+
+def import_tradebook(path: str | Path, *, overrides: dict[str, str] | None = None,
+                     source: str = "groww") -> dict:
+    """Import a Groww order-history / tradebook export into the `trades` table
+    (raw executions). Idempotent — re-importing the same file adds nothing new.
+
+    This is the source the P&L report FIFO-matches into round-trips; it is kept
+    separate from `positions` (the paper/real lifecycle) so broker history never
+    pollutes the journal. Returns ``{"new": n, "rows": total}``."""
+    df = parse_csv(path, overrides)
+    if df.empty:
+        return {"new": 0, "rows": 0}
+    has_seg, has_exch = "segment" in df.columns, "exchange" in df.columns
+    has_charges, has_oid = "charges" in df.columns, "order_id" in df.columns
+    rows = []
+    for _, r in df.iterrows():
+        sym, side = r["symbol"], r["side"]
+        qty, price = float(r["qty"]), float(r["price"])
+        date_s = pd.Timestamp(r["date"]).strftime("%Y-%m-%d")
+        seg = _norm_segment(r["segment"]) if has_seg else "delivery"
+        exch = (str(r["exchange"]).upper() if has_exch and pd.notna(r["exchange"]) else "NSE")
+        charges = float(r["charges"]) if has_charges and pd.notna(r["charges"]) else None
+        oid = str(r["order_id"]) if has_oid and pd.notna(r["order_id"]) else None
+        rows.append({
+            "dedupe_key": oid or _dedupe_key(date_s, sym, side, qty, price),
+            "ticker": sym, "side": side, "qty": qty, "price": price,
+            "trade_date": date_s, "segment": seg, "exchange": exch, "charges": charges,
+        })
+    new = upsert_trades(rows, source=source)
+    console.print(f"  trades: {len(rows)} parsed, {new} new")
+    return {"new": new, "rows": len(rows)}
+
+
+# Groww "Tax P&L" / Capital-Gains export: already-matched round trips.
+TAX_PNL_ALIASES = {
+    "symbol":     ["symbol", "stock", "stock name", "scrip", "scrip name",
+                   "company", "company name", "security", "instrument"],
+    "qty":        ["qty", "quantity", "quantity sold", "shares", "sold quantity"],
+    "buy_date":   ["buy date", "purchase date", "acquisition date", "buy_date", "date of purchase"],
+    "buy_price":  ["buy price", "purchase price", "buy avg", "buy average", "acquisition price",
+                   "purchase value per unit"],
+    "sell_date":  ["sell date", "sale date", "sell_date", "date of sale"],
+    "sell_price": ["sell price", "sale price", "sell avg", "sale value per unit"],
+    "gross_pnl":  ["realized p&l", "realised p&l", "realized pnl", "profit", "gain",
+                   "net p&l", "pnl", "realised profit", "gain/loss", "p&l"],
+    "charges":    ["charges", "total charges", "taxes & charges", "expenses"],
+}
+
+
+def parse_tax_pnl(path: str | Path, overrides: dict[str, str] | None = None) -> pd.DataFrame:
+    """Parse a Groww Tax-P&L / Capital-Gains export into matched round trips.
+
+    Returns canonical columns: ``symbol, qty, buy_date, sell_date, buy_price,
+    sell_price`` and, when present, ``gross_pnl`` / ``charges`` (Groww's *actual*
+    figures, preferred over the model). Format varies, so a preamble is skipped
+    and `overrides` can remap columns (same mechanism as the tradebook)."""
+    raw = pd.read_csv(path, header=None, dtype=str)
+    header_row = _find_tax_header(raw)
+    df = pd.read_csv(path, skiprows=header_row)
+    overrides = overrides or {}
+    lower = {c.lower().strip(): c for c in df.columns}
+    rename: dict[str, str] = {}
+    for canonical, aliases in TAX_PNL_ALIASES.items():
+        if canonical in overrides:
+            rename[overrides[canonical]] = canonical
+            continue
+        for a in aliases:
+            if a in lower:
+                rename[lower[a]] = canonical
+                break
+    df = df.rename(columns=rename)
+    required = {"symbol", "qty", "buy_date", "sell_date", "buy_price", "sell_price"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Tax P&L: missing columns {missing}. Found {list(df.columns)}. "
+            "Use column overrides (e.g. symbol=Stock,buy_date=Buy Date).")
+    df["symbol"] = df["symbol"].apply(_norm_symbol)
+    for c in ("qty", "buy_price", "sell_price", "gross_pnl", "charges"):
+        if c in df.columns:
+            df[c] = (df[c].astype(str).str.replace(r"[₹,]", "", regex=True)
+                     .pipe(pd.to_numeric, errors="coerce"))
+    for c in ("buy_date", "sell_date"):
+        parsed = pd.to_datetime(df[c], errors="coerce", format="ISO8601")
+        if parsed.isna().any():
+            parsed = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+        df[c] = parsed
+    df = df.dropna(subset=["symbol", "qty", "buy_date", "sell_date", "buy_price", "sell_price"])
+    return df.reset_index(drop=True)
+
+
+def _find_tax_header(raw: pd.DataFrame, max_scan: int = 30) -> int:
+    """Find the header row of a Tax-P&L export (Groww prepends a metadata block)."""
+    flat_aliases = {a for al in TAX_PNL_ALIASES.values() for a in al}
+    for i in range(min(max_scan, len(raw))):
+        cells = {str(v).lower().strip() for v in raw.iloc[i].tolist()}
+        if len(cells & flat_aliases) >= 3:
+            return i
+    return 0

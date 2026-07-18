@@ -54,6 +54,34 @@ BACKTEST_COST_PCT = float(os.getenv("SWINGDESK_BACKTEST_COST_PCT", "0.30"))
 TRAIL_BREAKEVEN_R = float(os.getenv("SWINGDESK_TRAIL_BE_R", "1.0"))
 TRAIL_ATR_MULT    = float(os.getenv("SWINGDESK_TRAIL_ATR_MULT", "1.5"))
 
+# ---- Groww charges (Indian equity) + capital-gains tax ----
+# Used by analyze.charges to itemise the real cost of a trade. Every rate is
+# overridable because Groww's brokerage and India's CG-tax rates have changed
+# over time — modelled charges are INDICATIVE; for exact figures use the actual
+# charge columns from a Groww contract-note / Tax-P&L export. Percentages are in
+# "percent of turnover" units (0.10 == 0.10%). Sources: Groww brokerage
+# calculator + NSE/SEBI rate cards (FY2024-25).
+GROWW_BROKERAGE_PCT_DELIVERY = float(os.getenv("SWINGDESK_BROK_DELIV_PCT", "0.10"))  # min(cap, 0.10%)
+GROWW_BROKERAGE_PCT_INTRADAY = float(os.getenv("SWINGDESK_BROK_INTRA_PCT", "0.05"))
+GROWW_BROKERAGE_CAP = float(os.getenv("SWINGDESK_BROK_CAP", "20.0"))   # ₹ per executed order
+STT_PCT_DELIVERY = 0.10        # % per leg (buy AND sell)
+STT_PCT_INTRADAY = 0.025       # % on the sell leg only
+EXCHANGE_TXN_PCT_NSE = 0.00297  # % of turnover
+EXCHANGE_TXN_PCT_BSE = 0.00375
+SEBI_TXN_PCT = 0.0001          # % (₹10 per crore)
+STAMP_PCT_DELIVERY = 0.015     # % on the buy leg only
+STAMP_PCT_INTRADAY = 0.003
+GST_PCT = 18.0                 # 18% on (brokerage + exchange txn + SEBI fee)
+DP_CHARGE_PER_SELL = float(os.getenv("SWINGDESK_DP_CHARGE", "15.93"))  # ₹/scrip on a delivery sell (incl GST)
+
+# Capital-gains tax on listed equity (post 2024-07-23 budget). Indicative only —
+# not tax advice. Pre-2024-07-23 sales used 15% STCG / 10% LTCG; override if
+# analysing older years.
+LTCG_HOLDING_DAYS = 365
+STCG_TAX_PCT = float(os.getenv("SWINGDESK_STCG_PCT", "20.0"))   # Sec 111A
+LTCG_TAX_PCT = float(os.getenv("SWINGDESK_LTCG_PCT", "12.5"))   # Sec 112A
+LTCG_EXEMPTION = float(os.getenv("SWINGDESK_LTCG_EXEMPTION", "125000"))  # ₹1.25L/year, applied portfolio-wide
+
 # Default watchlist — large-cap + popular swing-trading names on NSE.
 # yfinance suffix for NSE: ".NS". For BSE: ".BO".
 # Edit freely; this is also editable in the Streamlit UI.
