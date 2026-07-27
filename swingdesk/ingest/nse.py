@@ -25,7 +25,7 @@ import pandas as pd
 import requests
 from rich.console import Console
 
-from swingdesk.storage import upsert_deals, upsert_delivery
+from swingdesk.storage import existing_deal_keys, upsert_deals, upsert_delivery
 
 console = Console()
 
@@ -204,6 +204,73 @@ def ingest_deals(tickers: list[str] | None = None) -> int:
         console.print(f"  {deal_type} deals: {len(rows)} rows")
     console.print(f"[green]saved {total} deal rows[/green]")
     return total
+
+
+# --- LIVE large-deals feed (intraday) ------------------------------------------
+# The bulk.csv/block.csv archives above are END-OF-DAY. NSE also exposes a live
+# "Large Deals" JSON feed that updates THROUGH the trading day as deals are
+# disclosed to the exchange — the earliest a bulk/block deal is publicly
+# available (bounded by SEBI's disclosure lag: ~1h for bulk, post-window for
+# block; never instant-at-execution). Same fields, so it upserts into `deals`
+# alongside the EOD data and flows straight into the institutional-flow tables.
+_LIVE_DEALS_URL = "https://www.nseindia.com/api/snapshot-capital-market-largedeal"
+
+
+def fetch_live_large_deals(session: requests.Session | None = None) -> list[dict]:
+    """Fetch NSE's live large-deals feed, returning rows in the `deals` schema
+    (same shape as :func:`_parse_deals`). Returns [] on any failure — the feed is
+    best-effort, never raises, so a poll loop keeps going."""
+    s = session or _session()
+    try:
+        r = s.get(_LIVE_DEALS_URL, timeout=25)
+        if r.status_code != 200:
+            return []
+        j = r.json()
+    except Exception:
+        return []
+
+    rows: list[dict] = []
+    for deal_type, key in (("bulk", "BULK_DEALS_DATA"), ("block", "BLOCK_DEALS_DATA")):
+        for d in (j.get(key) or []):
+            symbol = str(d.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            raw_date = d.get("date")
+            try:
+                iso = pd.to_datetime(raw_date, format="%d-%b-%Y").date().isoformat()
+            except (ValueError, TypeError):
+                try:
+                    iso = pd.to_datetime(raw_date, dayfirst=True).date().isoformat()
+                except Exception:
+                    continue
+            rows.append({
+                "deal_type": deal_type,
+                "date": iso,
+                "ticker": to_ticker(symbol),
+                "security": str(d.get("name", "")).strip() or None,
+                "client": str(d.get("clientName", "")).strip() or None,
+                "side": str(d.get("buySell", "")).strip().upper() or None,
+                "qty": _num(d.get("qty")),
+                "price": _num(d.get("watp")),   # watp = weighted-avg trade price
+            })
+    return rows
+
+
+def ingest_live_deals(session: requests.Session | None = None) -> tuple[int, list[dict]]:
+    """Fetch the live feed, upsert into `deals`, and return
+    ``(rows_seen, new_rows)`` where ``new_rows`` weren't already stored (by the
+    deals primary key). Lets a poller alert only on genuinely new disclosures."""
+    rows = fetch_live_large_deals(session)
+    if not rows:
+        return 0, []
+    existing = existing_deal_keys()
+    new_rows = [
+        r for r in rows
+        if (r["deal_type"], r["date"], r["ticker"], r.get("client"),
+            r.get("side"), r.get("qty")) not in existing
+    ]
+    upsert_deals(rows)
+    return len(rows), new_rows
 
 
 def ingest(tickers: list[str], days: int = 20) -> dict[str, int]:

@@ -929,6 +929,16 @@ def upsert_deals(rows: list[dict]) -> int:
     return len(rows)
 
 
+def existing_deal_keys() -> set[tuple]:
+    """Return the primary-key tuple of every stored deal
+    ``(deal_type, date, ticker, client, side, qty)``. Used by the live-deal
+    poller to tell genuinely new disclosures from ones already seen."""
+    with connect() as con:
+        cur = con.execute(
+            "SELECT deal_type, date, ticker, client, side, qty FROM deals")
+        return {tuple(row) for row in cur.fetchall()}
+
+
 def load_deals(ticker: str | None = None, days: int | None = None) -> pd.DataFrame:
     q = "SELECT deal_type, date, ticker, security, client, side, qty, price FROM deals"
     params: tuple = ()

@@ -41,6 +41,7 @@ from swingdesk.analyze import intraday as intraday_mod
 from swingdesk.analyze import catalyst as catalyst_mod
 from swingdesk.analyze import global_impact as global_impact_mod
 from swingdesk.analyze import institutional as inst_mod
+from swingdesk.analyze import results_watch as results_watch_mod
 from swingdesk.analyze import signal_analysis as sigan_mod
 from swingdesk.analyze import screener as screener_mod
 from swingdesk.analyze import sudden_move as sudden_move_mod
@@ -173,6 +174,7 @@ def _clear_data_caches() -> None:
     _cached_explosive_backtest.clear()
     _cached_global_impacts.clear()
     _cached_decisions.clear()
+    _cached_results_watch.clear()
     _cached_realized.clear()
     _cached_board.clear()
     _cached_market_pulse.clear()
@@ -375,6 +377,42 @@ def _cached_catalysts(days: int, limit: int):
     return catalyst_mod.scan_catalysts(days=days, limit=limit)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _sell_reason(ticker: str) -> dict:
+    """Best-effort 'why' for a heavy institutional sell: the most relevant
+    bearish / high-impact classified-news item for this ticker. This is a
+    correlation heuristic — the bulk/block tape carries no reason, so we surface
+    nearby negative news, NOT proven causation. Returns {} when nothing fits."""
+    nd = load_news(limit=40, ticker=ticker)
+    if nd.empty:
+        return {}
+    # load_news uses a LIKE match; keep only rows that actually tag this ticker.
+    tagged = nd[nd["tickers"].fillna("").apply(lambda s: ticker in s.split(","))]
+    if tagged.empty:
+        return {}
+    imp = {"high": 3, "medium": 2, "low": 1}
+    tagged = tagged.copy()
+    tagged["_bear"] = (tagged["sentiment"] == "bearish").astype(int)
+    tagged["_imp"] = tagged["impact"].map(imp).fillna(0)
+    tagged["_pub"] = pd.to_datetime(tagged["published"], errors="coerce", utc=True)
+    # Bearish first, then higher impact, then most recent.
+    tagged = tagged.sort_values(["_bear", "_imp", "_pub"],
+                                ascending=[False, False, False])
+    top = tagged.iloc[0]
+    # Only call it a "reason" if it's actually negative or high-impact — otherwise
+    # neutral routine coverage would masquerade as a sell rationale.
+    if int(top["_bear"]) == 0 and float(top["_imp"]) < 3:
+        return {}
+    return {
+        "sentiment": top.get("sentiment"),
+        "event": (top.get("event_type") or "").replace("_", " "),
+        "why": (top.get("rationale") or top.get("title") or "").strip(),
+        "when": str(top.get("published") or "")[:10],
+        "title": top.get("title"),
+        "link": top.get("link"),
+    }
+
+
 @st.cache_data(ttl=900, show_spinner="Scoring sudden-move pressure…")
 def _cached_sudden_radar(tickers: tuple, intraday: bool, limit: int):
     return sudden_move_mod.scan(list(tickers), include_intraday=intraday, limit=limit)
@@ -420,6 +458,12 @@ def _cached_inst_flow(days: int, marquee: bool):
 @st.cache_data(ttl=900, show_spinner=False)
 def _cached_brokerage(days: int):
     return inst_mod.brokerage_actions(days=days, limit=50)
+
+
+@st.cache_data(ttl=900, show_spinner="Building results watch…")
+def _cached_results_watch(tickers: tuple, days_ahead: int, include_unknown: bool):
+    return results_watch_mod.scan(
+        list(tickers), days_ahead=days_ahead, include_unknown_dates=include_unknown)
 
 
 @st.cache_data(ttl=900, show_spinner="Fusing all signals into one verdict…")
@@ -2315,11 +2359,72 @@ if _page == "📡 Scanners":
     st.subheader("📡 Scanners")
     st.caption("Descriptive market scans — what's unusual or moving right now. "
                "These are observations, not recommendations. Do your own research.")
-    _scanner = st.radio("Scanner", ["🧭 Confluence", "⚡ Sudden Move Radar", "🌍 Global Impact",
-                                    "📰 News Catalyst", "🏛 Institutional Flow"],
+    _scanner = st.radio("Scanner", ["📊 Results Watch", "🧭 Confluence", "⚡ Sudden Move Radar",
+                                    "🌍 Global Impact", "📰 News Catalyst",
+                                    "🏛 Institutional Flow"],
                         horizontal=True, key="_scanner_pick")
 
-    if _scanner == "🧭 Confluence":
+    if _scanner == "📊 Results Watch":
+        st.markdown("**Results Watch** — upcoming result dates fused with available "
+                    "growth/margin trend, brokerage tone, disclosed institutional tape "
+                    "and pre-result price behavior.")
+        r1, r2, r3, r4 = st.columns([1, 1, 1, 1])
+        rw_days = r1.slider("Result horizon", 7, 90, 45, key="_rw_days")
+        rw_unknown = r2.checkbox("Include unknown dates", key="_rw_unknown",
+                                 help="Keeps watchlist names visible even when the exact result date is not stored yet.")
+        rw_scope = r3.radio("Universe", ["Watchlist + holdings", "Include small caps"],
+                            key="_rw_scope")
+        if r4.button("Refresh earnings dates", key="_rw_refresh_earnings"):
+            from swingdesk.ingest import earnings as _earnings
+            rw_universe_refresh = combined_universe(
+                include_smallcaps=(rw_scope == "Include small caps"))
+            with st.spinner("Fetching result dates…"):
+                n = _earnings.ingest(rw_universe_refresh)
+            _cached_results_watch.clear()
+            st.success(f"{n} upcoming result date(s) stored")
+
+        rw_universe = combined_universe(include_smallcaps=(rw_scope == "Include small caps"))
+        watch = _cached_results_watch(tuple(rw_universe), rw_days, rw_unknown)
+        if watch.empty:
+            st.info("No upcoming result rows yet. Click **Refresh earnings dates** or run "
+                    "`swingdesk earnings`, then refresh fundamentals/news/deals for a richer read.")
+        else:
+            display_cols = [
+                "ticker", "result_date", "days_left", "window",
+                "revenue_growth", "earnings_growth", "profit_margin",
+                "operating_margin", "pre_result_move_pct", "broker_tone",
+                "broker_count", "institutional_flow", "institutional_value_cr",
+                "marquee", "gap_risk", "readiness", "notes",
+            ]
+            st.dataframe(
+                watch[display_cols],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "ticker": st.column_config.TextColumn("Ticker"),
+                    "result_date": st.column_config.TextColumn("Result date"),
+                    "days_left": st.column_config.NumberColumn("Days left"),
+                    "window": st.column_config.TextColumn("Window"),
+                    "revenue_growth": st.column_config.NumberColumn("Rev YoY %"),
+                    "earnings_growth": st.column_config.NumberColumn("Profit/EPS YoY %"),
+                    "profit_margin": st.column_config.NumberColumn("Profit margin %"),
+                    "operating_margin": st.column_config.NumberColumn("Operating margin %"),
+                    "pre_result_move_pct": st.column_config.NumberColumn("20-session move %"),
+                    "broker_tone": st.column_config.TextColumn("Broker tone"),
+                    "broker_count": st.column_config.NumberColumn("Broker calls"),
+                    "institutional_flow": st.column_config.TextColumn("Deal flow"),
+                    "institutional_value_cr": st.column_config.NumberColumn("Deal ₹cr"),
+                    "marquee": st.column_config.TextColumn("Marquee"),
+                    "gap_risk": st.column_config.TextColumn("Gap risk"),
+                    "readiness": st.column_config.TextColumn("Readiness"),
+                    "notes": st.column_config.TextColumn("Notes"),
+                },
+            )
+            st.caption("Growth/margin fields are currently stored fundamental trend proxies. "
+                       "True analyst-consensus estimates need a dedicated data source/API; "
+                       "brokerage tone comes from recent headlines and target-action text.")
+
+    elif _scanner == "🧭 Confluence":
         st.markdown("**Explosive Move Confluence** — stocks where the available "
                     "evidence suggests a large one-day expansion is structurally "
                     "possible. This is a watchlist and playbook, not a guarantee.")
@@ -2546,17 +2651,47 @@ if _page == "📡 Scanners":
                     "**bulk & block deals**, plus sell-side **brokerage calls**. "
                     "Disclosed/published data only — and remember to follow long-only "
                     "accumulators, not prop/market-makers.")
-        c1, c2, c3 = st.columns([1, 1, 1])
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
         inst_days = c1.slider("Lookback (days)", 7, 90, 30, key="_inst_days")
         inst_marquee = c2.checkbox(
             "Marquee only", key="_inst_marquee",
             help="Only stocks with BlackRock / Morgan Stanley / JPMorgan / Jefferies / GIC / a big MF on the tape")
-        if c3.button("Fetch latest deals", help="Pull today's bulk/block deals market-wide"):
+        if c3.button("Fetch EOD deals", help="Pull the end-of-day bulk/block archive market-wide"):
             from swingdesk.ingest import nse as _nse
             with st.spinner("Fetching NSE bulk/block deals…"):
                 _nse.ingest_deals(None)
             _cached_inst_flow.clear()
             st.success("deals updated")
+        if c4.button("🔴 Pull LIVE now",
+                     help="Fetch NSE's INTRADAY large-deals feed right now — deals as "
+                          "they're disclosed to the exchange (bounded by SEBI's ~1h lag, "
+                          "not end-of-day)."):
+            from swingdesk.ingest import nse as _nse
+            with st.spinner("Pulling live large deals…"):
+                _seen, _new = _nse.ingest_live_deals()
+            _cached_inst_flow.clear()
+            st.success(f"live feed: {_seen} deals · {len(_new)} new")
+
+        # Live auto-refresh: poll the intraday feed while this tab stays open.
+        inst_live = st.toggle(
+            "🔴 Live intraday auto-refresh (every 2 min)", key="_inst_live",
+            help="While on, polls NSE's live large-deals feed every 2 minutes and "
+                 "refreshes the tables when new deals are disclosed. Only runs while "
+                 "this tab is open — for hands-off alerts run the standalone poller "
+                 "(python -m swingdesk.live_deals_watch).")
+        if inst_live:
+            @st.fragment(run_every=120)
+            def _inst_live_tick():
+                from swingdesk.ingest import nse as _nse
+                _seen, _new = _nse.ingest_live_deals()
+                _now = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%H:%M:%S")
+                if _new:
+                    _cached_inst_flow.clear()
+                    st.caption(f"🔴 live · {_now} IST · {len(_new)} new deal(s) — refreshing…")
+                    st.rerun(scope="app")
+                else:
+                    st.caption(f"🔴 live · {_now} IST · no new deals (feed={_seen})")
+            _inst_live_tick()
 
         flows = _cached_inst_flow(inst_days, inst_marquee)
         st.markdown("##### Deal flow (bulk + block)")
@@ -2575,12 +2710,70 @@ if _page == "📡 Scanners":
             st.dataframe(pd.DataFrame([{
                 "Stock": f.ticker,
                 "Company": f.security or "",
+                "Latest deal": f.latest_date or "—",
                 "Net": f.net_side,
                 "₹cr": round(f.net_value / 1e7, 2) if f.net_value else 0.0,
                 "Buyers": _names(f, True),
                 "Sellers": _names(f, False),
                 "Marquee": " · ".join(f.marquee),
-            } for f in flows]), width="stretch", hide_index=True)
+            } for f in flows]), width="stretch", hide_index=True,
+                column_config={
+                    "Latest deal": st.column_config.TextColumn(
+                        "Latest deal",
+                        help="Most recent disclosed bulk/block-deal date for this stock "
+                             "in the lookback window. Click the header to sort by date."),
+                })
+
+        st.markdown("##### 🔻 Heaviest institutional selling — with a possible reason")
+        st.caption("Net-**sell** stocks from the disclosed bulk/block tape, largest "
+                   "first, with a *possible* reason inferred from recent "
+                   "bearish/high-impact news for that stock. This is **correlation, "
+                   "not proof** — the deal tape carries no reason. **—** = no matching "
+                   "news found. (Sellers here are mostly prop/HFT desks, not FII/DII "
+                   "net flows.)")
+        _sells = sorted((f for f in flows if f.net_side == "SELL"),
+                        key=lambda f: abs(f.net_value), reverse=True)
+        if not _sells:
+            st.info("No net-sell stocks in the current window. Widen the lookback "
+                    "or click **Fetch latest deals**.")
+        else:
+            _mark = {"bearish": "🔴", "neutral": "⚪", "bullish": "🟢"}
+            _rows = []
+            for f in _sells[:20]:
+                seen = [c.title() for c, s in f.clients if s.startswith("S")]
+                sellers = ", ".join(list(dict.fromkeys(seen))[:4])
+                r = _sell_reason(f.ticker)
+                if r:
+                    parts = [p for p in (r.get("event"), r.get("why")) if p]
+                    reason = (_mark.get(r.get("sentiment"), "") + " " +
+                              " · ".join(parts)).strip() if parts else "—"
+                    when = r.get("when") or ""
+                else:
+                    reason, when = "—", ""
+                _rows.append({
+                    "Stock": f.ticker,
+                    "Company": f.security or "",
+                    "Sell ₹cr": round(abs(f.net_value) / 1e7, 2),
+                    "Latest deal": f.latest_date or "—",
+                    "Sellers": sellers,
+                    "Possible reason": reason,
+                    "News date": when,
+                })
+            st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True,
+                column_config={
+                    "Sell ₹cr": st.column_config.NumberColumn(
+                        "Sell ₹cr",
+                        help="Net rupee value sold on the bulk/block tape, in crores."),
+                    "Possible reason": st.column_config.TextColumn(
+                        "Possible reason",
+                        help="Inferred from recent bearish/high-impact classified news "
+                             "for this stock — correlation, not causation. Run "
+                             "'Analyze news' to populate if this is mostly empty."),
+                    "News date": st.column_config.TextColumn(
+                        "News date",
+                        help="Publish date of the news the reason came from — compare "
+                             "against 'Latest deal' to judge how related they are."),
+                })
 
         st.markdown("##### Brokerage calls (sell-side desks)")
         actions = _cached_brokerage(inst_days)

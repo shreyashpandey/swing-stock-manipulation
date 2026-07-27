@@ -26,6 +26,15 @@ SENTIMENT_BATCH_SIZE = int(os.getenv("SWINGDESK_SENTIMENT_BATCH", "15"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# --- Live bulk/block deal poller (python -m swingdesk.live_deals_watch) ----
+# Polls NSE's live large-deals feed intraday and Telegram-alerts on new heavy
+# SELL disclosures. Latency floor is SEBI's disclosure lag (~1h bulk / post-window
+# block), not instant. All overridable via .env.
+LIVE_DEALS_POLL_SECS = int(os.getenv("SWINGDESK_DEALS_POLL_SECS", "720"))       # 12 min
+LIVE_DEALS_MIN_SELL_CR = float(os.getenv("SWINGDESK_DEALS_MIN_SELL_CR", "5.0"))  # alert threshold, ₹cr
+LIVE_DEALS_START_HHMM = os.getenv("SWINGDESK_DEALS_START", "09:00")             # IST poll window start
+LIVE_DEALS_END_HHMM = os.getenv("SWINGDESK_DEALS_END", "19:00")                 # IST poll window end
+
 # ---- Portfolio / risk sizing ----
 # All in INR. Override via .env if needed.
 ACCOUNT_CAPITAL = float(os.getenv("SWINGDESK_CAPITAL", "100000"))     # ₹1 lakh default
