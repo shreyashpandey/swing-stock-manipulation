@@ -2,7 +2,17 @@
 
 Local swing-trading signal app for Indian equities (NSE). Runs on your Mac, stores everything in SQLite, no cloud.
 
-**Current phase: Week 2** — adds Claude sentiment, composite scoring, Telegram alerts, and a scheduler daemon on top of Week 1.
+**Current state:** local analytics workbench with scanners, charts, backtesting,
+portfolio import, risk analysis, fundamentals, news, and saved research workflows.
+
+Open **Discover → Research workspace** for named watchlists, reusable filter screens,
+CSV exports, stock comparisons, a sector-grouped return heatmap, and saved daily
+price/volume alert conditions. Alert checks are manual and use stored data.
+
+See [the documentation guide](docs/README.md) for product direction, architecture,
+and the distinction between implemented features and planned competitor capabilities.
+The [business implementation plan](docs/BUSINESS_IMPLEMENTATION_PLAN.md) defines
+the proposed path from the local app to a paid web beta.
 
 ## Setup
 
@@ -67,8 +77,9 @@ Each signal returns: entry, stoploss (ATR-based), target, R:R, score, notes.
 
 Defaults to Nifty-50-style names in `swingdesk/config.py`. Edit in the Streamlit sidebar (`Save watchlist`) or via `swingdesk.cli watchlist --set ...`. NSE tickers need the `.NS` suffix, BSE uses `.BO`.
 
-## Coming next
+## Product roadmap
 
-- Week 2: Claude sentiment on news, signal scoring, Telegram alerts, scheduler
-- Week 3: backtest engine
-- Week 4: portfolio tracker + Groww CSV import + paper trading
+The local engine already includes backtesting, portfolio tracking, Groww imports,
+and paper trading. Cloud accounts, broker sync, continuous custom alerts, and mobile
+apps remain planned. See [competitor feature delivery](docs/COMPETITOR_FEATURE_DELIVERY.md)
+for the latest implementation scope and remaining gaps.

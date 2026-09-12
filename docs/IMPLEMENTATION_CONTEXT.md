@@ -2,6 +2,37 @@
 
 Last reviewed: 2026-07-07
 
+## Latest implementation note: 2026-09-11
+
+Business planning update: [Business implementation plan](BUSINESS_IMPLEMENTATION_PLAN.md)
+now consolidates the proposed paid-beta scope, pricing assumptions, migration,
+ordered backlog, and launch gates. It is a plan; the production backend, account
+ownership and billing described there have not been implemented.
+
+Review update: [Plan risk review](PLAN_RISK_REVIEW.md) records frontend/backend
+gaps and Indian regulatory findings. Local reproductions confirmed that gapped
+stored observations can be labelled a one-session return and boolean thresholds
+pass numeric validation. These findings are now fixed: returns are labelled as
+stored-observation windows with actual dates, and boolean thresholds are rejected.
+See [implementation review and fixes](CURRENT_IMPLEMENTATION_REVIEW.md). The plan now estimates
+62–97 engineering days, adds privacy/session/recovery work, and requires appropriate
+permissions and substantive feature review before external exposure.
+
+The app currently uses grouped primary-section navigation and already includes a
+disclaimer gate and Settings & Legal. Navigation comments later in this document
+describe an earlier revision.
+
+Added **Discover → Research workspace** with named watchlists, saved numeric
+screens and CSV export, stock comparison charts, return heatmaps, and manual
+price/volume alert checks. UI lives in `swingdesk/research_ui.py`; analysis and
+saved-object persistence live in `swingdesk/analyze/research.py`. An additive
+`research_items` table stores local objects without changing the main watchlist.
+
+See [delivery details and remaining scope](COMPETITOR_FEATURE_DELIVERY.md) and
+[the documentation guide](README.md). Price loading is read-only in the new page;
+users refresh data through existing actions. Custom alerts are not scheduled or
+connected to Telegram. New tests live in `tests/test_research.py`.
+
 ## What This Project Is
 
 SwingDesk is a local-first Python app for Indian equity swing-trading analytics. It uses:
@@ -12,6 +43,13 @@ SwingDesk is a local-first Python app for Indian equity swing-trading analytics.
 - Offline-friendly tests with a temporary SQLite DB and mocked price ingestion.
 
 The product direction in `docs/PRODUCT_BLUEPRINT.md` is broader and newer than the README. The README still describes "Week 2", while the implementation already includes backtesting, portfolio import, P&L/tax reporting, scanners, fundamentals, intraday analytics, ML probability, execution/TCA, and productization/compliance planning.
+
+For the current no-advisory launch posture, also read:
+
+- `docs/BUSINESS_MODEL_NO_SEBI_ADVISOR.md`
+- `docs/COMPLIANT_FEATURE_WIREFRAMES.md`
+- `docs/APP_WORKFLOW_AND_WIREFRAME.md`
+- `docs/PRODUCTION_ARCHITECTURE.md`
 
 ## Core Architecture
 

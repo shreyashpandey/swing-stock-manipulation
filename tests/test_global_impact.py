@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from swingdesk.analyze import global_impact
 from swingdesk import storage
+import pandas as pd
+import pytest
 
 
 def test_map_headline_maps_crude_to_indian_sectors():
@@ -26,12 +28,13 @@ def test_map_headline_ignores_non_market_noise():
     ) is None
 
 
-def test_global_news_storage_roundtrip(tmp_db):
+@pytest.mark.parametrize("age_days", [1, 60])
+def test_global_news_storage_roundtrip(tmp_db, age_days):
     storage.insert_global_news([{
         "source": "Test",
         "title": "Nasdaq rally boosts AI technology stocks",
         "link": "http://example.com/tech",
-        "published": "2026-07-07T09:00:00",
+        "published": (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=age_days)).strftime("%Y-%m-%d %H:%M:%S"),
         "summary": "",
         "cue": "us_tech",
         "direction": "positive",
@@ -44,6 +47,10 @@ def test_global_news_storage_roundtrip(tmp_db):
     assert len(df) == 1
     assert df.iloc[0]["cue"] == "us_tech"
     score, reasons = global_impact.ticker_impact_score("TCS.NS", days=30)
-    assert score > 0
-    assert reasons and "us_tech" in reasons[0]
+    if age_days < 30:
+        assert score > 0
+        assert reasons and "us_tech" in reasons[0]
+    else:
+        assert score == 0
+        assert not reasons
 

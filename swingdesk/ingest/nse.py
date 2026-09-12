@@ -175,6 +175,7 @@ def _parse_deals(df: pd.DataFrame, deal_type: str, wanted: set[str] | None) -> l
         except Exception:
             continue
         rows.append({
+            "exchange": "NSE",
             "deal_type": deal_type,
             "date": iso,
             "ticker": to_ticker(symbol),
@@ -244,6 +245,7 @@ def fetch_live_large_deals(session: requests.Session | None = None) -> list[dict
                 except Exception:
                     continue
             rows.append({
+                "exchange": "NSE",
                 "deal_type": deal_type,
                 "date": iso,
                 "ticker": to_ticker(symbol),
@@ -266,7 +268,7 @@ def ingest_live_deals(session: requests.Session | None = None) -> tuple[int, lis
     existing = existing_deal_keys()
     new_rows = [
         r for r in rows
-        if (r["deal_type"], r["date"], r["ticker"], r.get("client"),
+        if (r["exchange"], r["deal_type"], r["date"], r["ticker"], r.get("client"),
             r.get("side"), r.get("qty")) not in existing
     ]
     upsert_deals(rows)

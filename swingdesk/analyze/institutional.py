@@ -78,6 +78,7 @@ class InstitutionalFlow:
     net_side: str                       # "BUY" | "SELL" | "FLAT"
     clients: list[tuple[str, str]] = field(default_factory=list)   # (name, side)
     marquee: list[str] = field(default_factory=list)
+    exchanges: list[str] = field(default_factory=list)
     latest_date: str | None = None
 
 
@@ -90,6 +91,20 @@ class BrokerageAction:
     headline: str
     published: str | None = None
     link: str | None = None
+
+
+@dataclass
+class InvestorActivity:
+    client: str
+    n_deals: int
+    tickers: list[str]
+    buy_value: float
+    sell_value: float
+    net_value: float
+    net_side: str
+    marquee: str | None = None
+    exchanges: list[str] = field(default_factory=list)
+    latest_date: str | None = None
 
 
 def _match_marquee(client: str | None) -> str | None:
@@ -124,7 +139,8 @@ def aggregate_flow(deals: pd.DataFrame, only_marquee: bool = False,
         a = agg.setdefault(tk, {"security": getattr(r, "security", None), "n": 0,
                                 "buy_qty": 0.0, "sell_qty": 0.0,
                                 "buy_val": 0.0, "sell_val": 0.0,
-                                "clients": [], "marquee": set(), "latest": None})
+                                "clients": [], "marquee": set(), "exchanges": set(),
+                                "latest": None})
         a["n"] += 1
         if side.startswith("B"):
             a["buy_qty"] += qty
@@ -132,6 +148,9 @@ def aggregate_flow(deals: pd.DataFrame, only_marquee: bool = False,
         elif side.startswith("S"):
             a["sell_qty"] += qty
             a["sell_val"] += value
+        ex = str(getattr(r, "exchange", "") or "").upper()
+        if ex:
+            a["exchanges"].add(ex)
         client = getattr(r, "client", None)
         if client:
             a["clients"].append((str(client), side))
@@ -156,6 +175,7 @@ def aggregate_flow(deals: pd.DataFrame, only_marquee: bool = False,
             buy_value=round(a["buy_val"], 2), sell_value=round(a["sell_val"], 2),
             net_value=round(net_val, 2), net_side=net_side,
             clients=a["clients"][:12], marquee=sorted(a["marquee"]),
+            exchanges=sorted(a["exchanges"]),
             latest_date=a["latest"],
         ))
     # Marquee names first, then by absolute net value traded.
@@ -168,6 +188,84 @@ def recent_institutional_flow(days: int = 30, only_marquee: bool = False,
     """Live: aggregate the last `days` of stored bulk/block deals. Run
     ``swingdesk nse --all-deals`` first to capture market-wide deals."""
     return aggregate_flow(load_deals(days=days), only_marquee=only_marquee, limit=limit)
+
+
+def investor_activity(days: int = 30, net_side: str | None = None,
+                      limit: int = 30) -> list[InvestorActivity]:
+    """Group recent disclosed deals by investor/client across stocks."""
+    deals = load_deals(days=days)
+    if deals.empty:
+        return []
+    agg: dict[str, dict] = {}
+    for r in deals.itertuples():
+        client = str(getattr(r, "client", "") or "").strip()
+        if not client:
+            continue
+        side = str(getattr(r, "side", "") or "").upper()
+        qty = float(getattr(r, "qty", 0) or 0)
+        price = float(getattr(r, "price", 0) or 0)
+        value = qty * price
+        a = agg.setdefault(client, {
+            "n": 0, "buy_val": 0.0, "sell_val": 0.0, "tickers": set(),
+            "latest": None, "marquee": _match_marquee(client), "exchanges": set(),
+        })
+        a["n"] += 1
+        if side.startswith("B"):
+            a["buy_val"] += value
+        elif side.startswith("S"):
+            a["sell_val"] += value
+        ticker = str(getattr(r, "ticker", "") or "").strip()
+        if ticker:
+            a["tickers"].add(ticker)
+        ex = str(getattr(r, "exchange", "") or "").upper()
+        if ex:
+            a["exchanges"].add(ex)
+        d = getattr(r, "date", None)
+        d = str(d.date()) if hasattr(d, "date") else (str(d) if d is not None else None)
+        if d and (a["latest"] is None or d > a["latest"]):
+            a["latest"] = d
+
+    out: list[InvestorActivity] = []
+    want = (net_side or "").upper().strip()
+    for client, a in agg.items():
+        net_val = a["buy_val"] - a["sell_val"]
+        side = "BUY" if net_val > 0 else "SELL" if net_val < 0 else "FLAT"
+        if want and side != want:
+            continue
+        out.append(InvestorActivity(
+            client=client,
+            n_deals=a["n"],
+            tickers=sorted(a["tickers"])[:8],
+            buy_value=round(a["buy_val"], 2),
+            sell_value=round(a["sell_val"], 2),
+            net_value=round(net_val, 2),
+            net_side=side,
+            marquee=a["marquee"],
+            exchanges=sorted(a["exchanges"]),
+            latest_date=a["latest"],
+        ))
+    out.sort(key=lambda x: (bool(x.marquee), abs(x.net_value), x.n_deals), reverse=True)
+    return out[:limit]
+
+
+def deal_coverage(days: int = 30) -> pd.DataFrame:
+    """Simple coverage read: how much disclosed deal tape exists by exchange/type."""
+    deals = load_deals(days=days)
+    if deals.empty:
+        return pd.DataFrame(columns=["exchange", "deal_type", "rows", "latest_date", "stocks", "clients"])
+    tmp = deals.copy()
+    tmp["date_only"] = tmp["date"].dt.strftime("%Y-%m-%d")
+    rows = []
+    for (exchange, deal_type), sub in tmp.groupby(["exchange", "deal_type"], dropna=False):
+        rows.append({
+            "exchange": exchange or "—",
+            "deal_type": deal_type or "—",
+            "rows": int(len(sub)),
+            "latest_date": str(sub["date_only"].max()),
+            "stocks": int(sub["ticker"].nunique()),
+            "clients": int(sub["client"].fillna("").replace("", pd.NA).dropna().nunique()),
+        })
+    return pd.DataFrame(rows).sort_values(["exchange", "deal_type"]).reset_index(drop=True)
 
 
 def extract_brokerage_action(title: str | None,

@@ -47,6 +47,7 @@ def test_score_frame_recognizes_compressed_prebreakout_setup():
     assert row.compression > 50
     assert row.prebreakout > 50
     assert row.catalyst > 50
+    assert row.anomaly_score >= 0
     assert "near breakout zone" in row.reasons
 
 
@@ -65,6 +66,23 @@ def test_scan_returns_ranked_dataframe(tmp_db):
     assert df.iloc[0]["radar_score"] >= df.iloc[1]["radar_score"]
 
 
+def test_score_frame_surfaces_anomaly_spike():
+    df = _coil_df()
+    df.loc[df.index[-1], "volume"] = float(df["volume"].iloc[-2] * 4.5)
+    df.loc[df.index[-1], "high"] = float(df["close"].iloc[-1] * 1.09)
+    df.loc[df.index[-1], "low"] = float(df["close"].iloc[-1] * 0.95)
+    row = sudden_move.score_frame(
+        "SPIKE.NS",
+        df,
+        fund={"market_cap": 6e9, "float_shares": 3e7, "shares_outstanding": 6e7},
+        include_manipulation=False,
+    )
+    assert row is not None
+    assert row.anomaly_score > 0
+    assert row.anomaly_volume_z > 1
+    assert row.anomaly_range_z > 1
+
+
 def test_backtest_reports_hits_after_high_radar_scores(tmp_db):
     # Build a coil where the next bar after day 120 jumps >3%.
     df = _coil_df(150, breakout_at=120)
@@ -79,4 +97,38 @@ def test_backtest_reports_hits_after_high_radar_scores(tmp_db):
     assert summary["n"] > 0
     assert {"ticker", "date", "radar_score", "hit_high"}.issubset(trades.columns)
     assert trades["hit_high"].any()
+    for key in (
+        "roc_auc",
+        "pr_auc",
+        "precision_at_5",
+        "recall_at_5",
+        "avg_return_top_5_pct",
+        "sharpe_top_5",
+        "max_drawdown_top_5_pct",
+    ):
+        assert key in summary
 
+
+def test_ranking_metrics_return_bounded_scores():
+    trades = pd.DataFrame(
+        {
+            "date": ["2025-01-01"] * 3 + ["2025-01-02"] * 3,
+            "radar_score": [90, 82, 70, 88, 65, 50],
+            "hit_high": [True, False, False, True, True, False],
+            "next_close_ret_pct": [4.2, -0.5, 0.1, 3.4, 1.8, -1.0],
+        }
+    )
+    metrics = sudden_move.ranking_metrics(
+        trades,
+        score_col="radar_score",
+        hit_col="hit_high",
+        return_col="next_close_ret_pct",
+        ks=(2, 3),
+    )
+    assert 0.0 <= metrics["roc_auc"] <= 1.0
+    assert 0.0 <= metrics["pr_auc"] <= 1.0
+    assert 0.0 <= metrics["precision_at_2"] <= 1.0
+    assert 0.0 <= metrics["recall_at_2"] <= 1.0
+    assert metrics["avg_return_top_2_pct"] is not None
+    assert "sharpe_top_2" in metrics
+    assert "max_drawdown_top_2_pct" in metrics

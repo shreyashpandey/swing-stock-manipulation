@@ -9,6 +9,13 @@ import pandas as pd
 from swingdesk.config import DB_PATH
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS research_items (
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, name)
+);
 CREATE TABLE IF NOT EXISTS prices (
     ticker     TEXT NOT NULL,
     date       TEXT NOT NULL,
@@ -185,6 +192,7 @@ CREATE TABLE IF NOT EXISTS delivery (
 CREATE INDEX IF NOT EXISTS idx_delivery_ticker ON delivery(ticker);
 
 CREATE TABLE IF NOT EXISTS deals (
+    exchange    TEXT DEFAULT 'NSE',             -- 'NSE' | 'BSE'
     deal_type   TEXT NOT NULL,                  -- 'bulk' | 'block'
     date        TEXT NOT NULL,                  -- ISO yyyy-mm-dd
     ticker      TEXT NOT NULL,                  -- yfinance-style, e.g. RELIANCE.NS
@@ -193,7 +201,7 @@ CREATE TABLE IF NOT EXISTS deals (
     side        TEXT,                           -- 'BUY' | 'SELL'
     qty         REAL,
     price       REAL,
-    PRIMARY KEY (deal_type, date, ticker, client, side, qty)
+    PRIMARY KEY (exchange, deal_type, date, ticker, client, side, qty)
 );
 CREATE INDEX IF NOT EXISTS idx_deals_ticker ON deals(ticker);
 
@@ -272,6 +280,12 @@ CREATE TABLE IF NOT EXISTS global_news (
 );
 CREATE INDEX IF NOT EXISTS idx_global_news_published ON global_news(published);
 CREATE INDEX IF NOT EXISTS idx_global_news_cue ON global_news(cue);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -323,6 +337,22 @@ def init_db(db_path: Path | None = None) -> None:
         ]:
             if col not in existing_fund:
                 con.execute(ddl)
+        # 2e. Migrate `deals` for cross-exchange storage (NSE + BSE).
+        existing_deals = {r[1] for r in con.execute("PRAGMA table_info(deals)")}
+        if "exchange" not in existing_deals:
+            con.execute("ALTER TABLE deals ADD COLUMN exchange TEXT DEFAULT 'NSE'")
+        # Rebuild legacy keys transactionally; adding exchange alone is insufficient.
+        key_columns = [r[1] for r in sorted(
+            con.execute("PRAGMA table_info(deals)"), key=lambda r: r[5]) if r[5]]
+        if key_columns != ["exchange", "deal_type", "date", "ticker", "client", "side", "qty"]:
+            con.execute("BEGIN")
+            con.execute("ALTER TABLE deals RENAME TO deals_legacy")
+            deal_ddl = next(stmt.strip() for stmt in SCHEMA.split(";")
+                            if stmt.strip().startswith("CREATE TABLE IF NOT EXISTS deals ("))
+            con.execute(deal_ddl)
+            con.execute("INSERT INTO deals SELECT COALESCE(exchange, 'NSE'), "
+                        "deal_type, date, ticker, security, client, side, qty, price FROM deals_legacy")
+            con.execute("DROP TABLE deals_legacy")
         # 3. Now safe to create indexes (the columns they reference exist).
         for stmt in SCHEMA.split(";"):
             s = stmt.strip()
@@ -589,6 +619,23 @@ def load_autotrader_log(limit: int = 200) -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT * FROM autotrader_log ORDER BY id DESC LIMIT ?", con,
             params=(limit,))
+
+
+def get_app_setting(key: str, default: str | None = None) -> str | None:
+    with connect() as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return default
+    return row["value"]
+
+
+def set_app_setting(key: str, value: str) -> None:
+    with connect() as con:
+        con.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            (key, value),
+        )
 
 
 def upsert_earnings(ticker: str, next_earnings: str | None,
@@ -919,32 +966,36 @@ def upsert_deals(rows: list[dict]) -> int:
     """Insert/replace bulk/block deal rows."""
     if not rows:
         return 0
-    cols = ["deal_type", "date", "ticker", "security", "client", "side", "qty", "price"]
+    cols = ["exchange", "deal_type", "date", "ticker", "security", "client", "side", "qty", "price"]
     placeholders = ",".join(["?"] * len(cols))
     with connect() as con:
         con.executemany(
             f"INSERT OR REPLACE INTO deals ({','.join(cols)}) VALUES ({placeholders})",
-            [tuple(r.get(c) for c in cols) for r in rows],
+            [tuple((r.get(c) if c != "exchange" else (r.get(c) or "NSE")) for c in cols) for r in rows],
         )
     return len(rows)
 
 
 def existing_deal_keys() -> set[tuple]:
     """Return the primary-key tuple of every stored deal
-    ``(deal_type, date, ticker, client, side, qty)``. Used by the live-deal
+    ``(exchange, deal_type, date, ticker, client, side, qty)``. Used by the live-deal
     poller to tell genuinely new disclosures from ones already seen."""
     with connect() as con:
         cur = con.execute(
-            "SELECT deal_type, date, ticker, client, side, qty FROM deals")
+            "SELECT exchange, deal_type, date, ticker, client, side, qty FROM deals")
         return {tuple(row) for row in cur.fetchall()}
 
 
-def load_deals(ticker: str | None = None, days: int | None = None) -> pd.DataFrame:
-    q = "SELECT deal_type, date, ticker, security, client, side, qty, price FROM deals"
+def load_deals(ticker: str | None = None, days: int | None = None,
+               exchange: str | None = None) -> pd.DataFrame:
+    q = "SELECT exchange, deal_type, date, ticker, security, client, side, qty, price FROM deals"
     params: tuple = ()
     if ticker:
         q += " WHERE ticker=?"
         params = (ticker,)
+    if exchange:
+        q += (" AND " if " WHERE " in q else " WHERE ") + "exchange=?"
+        params += (exchange.upper(),)
     q += " ORDER BY date DESC"
     with connect() as con:
         df = pd.read_sql_query(q, con, params=params, parse_dates=["date"])

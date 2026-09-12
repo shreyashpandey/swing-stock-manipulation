@@ -22,6 +22,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+from swingdesk.metric_ui import render_backtest_metrics, render_market_pulse
 from swingdesk.analyze import chart_signals
 from swingdesk.analyze import glossary
 from swingdesk.analyze import discovery
@@ -69,6 +70,7 @@ from swingdesk.config import (
     RISK_PER_TRADE_PCT,
 )
 from swingdesk.ingest import fundamentals as fundamentals_ingest
+from swingdesk.ingest import bse as bse_ingest
 from swingdesk.ingest import global_news as global_news_ingest
 from swingdesk.ingest import macro as macro_ingest
 from swingdesk.ingest import news_rss, prices
@@ -85,6 +87,7 @@ from swingdesk.portfolio import journal as pj
 from swingdesk.portfolio import positions as portfolio
 from swingdesk.portfolio import paper_trader as paper_trader_mod
 from swingdesk.portfolio import reconcile as reconcile_mod
+import swingdesk.storage as storage_mod
 from swingdesk.storage import (
     add_to_smallcap_watchlist,
     combined_universe,
@@ -115,7 +118,11 @@ from swingdesk.storage import (
     set_watchlist,
 )
 
-st.set_page_config(page_title="SwingDesk", layout="wide", page_icon=":chart_with_upwards_trend:")
+st.set_page_config(
+    page_title="SwingDesk Analytics Workbench",
+    layout="wide",
+    page_icon=":chart_with_upwards_trend:",
+)
 
 init_db()
 seed_watchlist_if_empty(DEFAULT_WATCHLIST)
@@ -456,6 +463,16 @@ def _cached_inst_flow(days: int, marquee: bool):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def _cached_investor_activity(days: int, side: str):
+    return inst_mod.investor_activity(days=days, net_side=side, limit=25)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_deal_coverage(days: int):
+    return inst_mod.deal_coverage(days=days)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def _cached_brokerage(days: int):
     return inst_mod.brokerage_actions(days=days, limit=50)
 
@@ -506,25 +523,202 @@ def _cached_price_coverage(tickers: tuple):
                          "first": df.index.min().date(), "last": df.index.max().date()})
     return pd.DataFrame(rows)
 
-st.title("SwingDesk — local swing-trading signals (NSE)")
-st.caption("Run the daily refresh from the sidebar. All data is stored locally in SQLite.")
+
+def _get_app_setting(key: str, default: str | None = None) -> str | None:
+    getter = getattr(storage_mod, "get_app_setting", None)
+    if callable(getter):
+        return getter(key, default)
+    return default
+
+
+def _set_app_setting(key: str, value: str) -> None:
+    setter = getattr(storage_mod, "set_app_setting", None)
+    if callable(setter):
+        setter(key, value)
+        return
+    # Safe no-op fallback for older storage module versions still loaded by the runner.
+    return
+
+DISCLAIMER_VERSION = "2026-08-tool-not-advice"
+DISCLAIMER_KEY = "legal.disclaimer_version"
+DISCLAIMER_ACCEPTED_AT_KEY = "legal.disclaimer_accepted_at"
+FOOTER_COPY = (
+    "SwingDesk provides analytical tools and information for educational purposes only. "
+    "It is not investment advice and we are not a SEBI-registered Investment Adviser or "
+    "Research Analyst. Markets carry risk. Some analysis is generated using automated or AI tools."
+)
+PRIMARY_SECTIONS = {
+    "Home": ["Home"],
+    "Discover": [
+        "Discover", "Research workspace", "Signals", "🔎 Screener", "🏆 Rank", "News",
+        "🔀 Sectors", "📅 Calendar", "Small Caps", "Fundamentals",
+    ],
+    "Scanners": [
+        "🚨 Manipulation", "📡 Scanners", "🌐 Global", "📐 Range", "🤖 ML", "⚡ Intraday",
+    ],
+    "Portfolio": [
+        "My Holdings", "Portfolio", "🛡 Risk", "📟 Paper Trader",
+        "📒 P&L & Taxes", "Reconcile", "💸 Invest",
+    ],
+    "Lab": ["Chart", "Backtest", "Optimize", "🧭 Board", "🛠 Execution", "Raw data"],
+    "Settings": ["Settings & Legal"],
+}
+PAGE_TO_SECTION = {
+    page: section for section, pages in PRIMARY_SECTIONS.items() for page in pages
+}
+ANALYTICS_PAGES = {
+    "Research workspace",
+    "Discover", "Signals", "🔎 Screener", "🏆 Rank", "News", "🔀 Sectors", "📅 Calendar",
+    "Small Caps", "Fundamentals", "🚨 Manipulation", "📡 Scanners", "🌐 Global",
+    "📐 Range", "🤖 ML", "⚡ Intraday", "Chart", "Backtest", "Optimize", "🧭 Board",
+    "🛠 Execution", "Raw data",
+}
+
+
+def _render_disclaimer_gate() -> None:
+    accepted_version = _get_app_setting(DISCLAIMER_KEY)
+    if accepted_version == DISCLAIMER_VERSION:
+        return
+    st.title("Welcome to SwingDesk")
+    st.subheader("Analytics workbench for Indian equities")
+    st.warning(
+        "Before using the app, please confirm that you understand this is a research tool and not an advisory service."
+    )
+    st.markdown(
+        """
+        - SwingDesk is an analytics and research tool, not an advisory.
+        - It does not provide buy/sell recommendations or personalized investment advice.
+        - It is not a SEBI-registered Investment Adviser or Research Analyst.
+        - Outputs are informational and markets carry risk of loss.
+        - Some analysis is generated using automated and AI-assisted systems.
+        """
+    )
+    accepted = st.checkbox(
+        "I have read and understood the disclaimer and want to continue.",
+        key="legal_accept_checkbox",
+    )
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.caption(f"Disclaimer version: {DISCLAIMER_VERSION}")
+    with c2:
+        if st.button("Accept & Continue", type="primary", disabled=not accepted, width="stretch"):
+            ts = pd.Timestamp.now(tz="Asia/Kolkata").isoformat()
+            _set_app_setting(DISCLAIMER_KEY, DISCLAIMER_VERSION)
+            _set_app_setting(DISCLAIMER_ACCEPTED_AT_KEY, ts)
+            st.rerun()
+    st.stop()
+
+
+def _render_context_banner(page: str) -> None:
+    if page in ANALYTICS_PAGES:
+        st.info("Rule-based analytics and historical evidence only. This screen is not a recommendation.")
+
+
+def _render_home() -> None:
+    st.subheader("Home")
+    st.caption("Daily command center for research, scanners, portfolio monitoring, and experiments.")
+
+    wl = get_watchlist()
+    signals_df = load_signals(limit=12)
+    holdings_df = load_holdings()
+    positions_df = load_positions(status="open")
+    pulse = _cached_market_pulse()
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    events = market_calendar.upcoming(today.year, today=today, within_days=7)
+
+    hero1, hero2, hero3, hero4 = st.columns(4)
+    hero1.metric("Watchlist", f"{len(wl)} names")
+    hero2.metric("Recent screens", str(len(signals_df)))
+    hero3.metric("Holdings", str(len(holdings_df)))
+    hero4.metric("Open positions", str(len(positions_df)))
+
+    left, right = st.columns([1.25, 1])
+    with left:
+        st.markdown("### Market pulse")
+        render_market_pulse(pulse)
+
+        st.markdown("### Watchlist activity")
+        if signals_df.empty:
+            st.caption("No recent screen results yet. Run `Run scan` from the sidebar to populate this workspace.")
+        else:
+            view = signals_df.copy().head(8)
+            cols = [c for c in ["ticker", "setup", "score", "generated_at"] if c in view.columns]
+            st.dataframe(view[cols], width="stretch", hide_index=True)
+
+    with right:
+        st.markdown("### Upcoming events")
+        if events:
+            for ev in events[:6]:
+                when = ev.start.isoformat()
+                label = ev.name
+                note = ev.note
+                st.write(f"**{when}**  {label}")
+                if note:
+                    st.caption(note)
+        else:
+            st.caption("No near-term calendar events loaded for the current universe.")
+
+        st.markdown("### Workbench principles")
+        st.markdown(
+            """
+            - Discover ideas with filters you control.
+            - Use scanners to inspect unusual behavior and context.
+            - Track positions and risk without prescriptive advice.
+            - Validate any rule in backtests before acting.
+            """
+        )
+
+
+def _render_settings_legal() -> None:
+    st.subheader("Settings & Legal")
+    accepted_at = _get_app_setting(DISCLAIMER_ACCEPTED_AT_KEY, "Not accepted yet")
+    st.markdown("### Product posture")
+    st.markdown(
+        """
+        - SwingDesk is positioned as an analytics workbench, not an advisory product.
+        - The app shows rankings, scans, probabilities, ranges, and calculators.
+        - Final decisions stay with the user; the product should avoid buy/sell instruction language.
+        """
+    )
+    st.markdown("### Active disclaimer")
+    st.info(FOOTER_COPY)
+    st.caption(f"Accepted at: {accepted_at}")
+    st.caption(f"Version: {DISCLAIMER_VERSION}")
+    if st.button("Re-open disclaimer gate", width="stretch"):
+        _set_app_setting(DISCLAIMER_KEY, "pending")
+        st.rerun()
+
+
+def _render_footer() -> None:
+    st.divider()
+    st.caption(FOOTER_COPY)
+
+
+_render_disclaimer_gate()
+
+st.title("SwingDesk — analytics workbench for Indian equities")
+st.caption("A local research tool for scanners, rankings, portfolio tracking, and backtests. Data stays in SQLite on this machine.")
 
 # --- Sidebar: actions + watchlist ----------------------------------------------
-PAGES = [
-    "My Holdings", "📒 P&L & Taxes", "💸 Invest", "Discover", "Small Caps", "Signals", "Chart",
-    "News", "🔀 Sectors", "🚨 Manipulation", "📡 Scanners", "📅 Calendar", "Backtest", "Optimize",
-    "Portfolio", "Reconcile", "Fundamentals", "Raw data",
-    "🌐 Global", "📐 Range", "🛡 Risk", "🏆 Rank", "🔎 Screener", "🧭 Board", "🤖 ML", "⚡ Intraday",
-    "🛠 Execution", "📟 Paper Trader",
-]
 
 with st.sidebar:
     # Lazy navigation: ONLY the selected section's code runs each rerun (unlike
     # st.tabs, which executes all 22 bodies every time). This is the app's main
     # performance lever. Programmatic jumps set `_jump` before the widget.
     if "_jump" in st.session_state:
-        st.session_state["_nav"] = st.session_state.pop("_jump")
-    _page = st.selectbox("📍 Section", PAGES, key="_nav")
+        jump = st.session_state.pop("_jump")
+        if jump in PAGE_TO_SECTION:
+            st.session_state["_section"] = PAGE_TO_SECTION[jump]
+            st.session_state["_page"] = jump
+    if st.session_state.get("_section") not in PRIMARY_SECTIONS:
+        st.session_state["_section"] = "Home"
+    current_section = st.session_state.get("_section", "Home")
+    if st.session_state.get("_page") not in PRIMARY_SECTIONS[current_section]:
+        st.session_state["_page"] = PRIMARY_SECTIONS[current_section][0]
+    _section = st.selectbox("Primary section", list(PRIMARY_SECTIONS), key="_section")
+    if st.session_state.get("_page") not in PRIMARY_SECTIONS[_section]:
+        st.session_state["_page"] = PRIMARY_SECTIONS[_section][0]
+    _page = st.selectbox("Workspace", PRIMARY_SECTIONS[_section], key="_page")
     st.divider()
     st.header("Actions")
     if st.button("Fetch prices", width="stretch"):
@@ -585,6 +779,17 @@ with st.sidebar:
 
 
 # --- Pages: each block runs only when its section is selected (lazy) ------------
+if _page == "Home":
+    _render_home()
+elif _page == "Settings & Legal":
+    _render_settings_legal()
+
+_render_context_banner(_page)
+
+if _page == "Research workspace":
+    from swingdesk.research_ui import render as render_research
+    render_research()
+
 # --- Discover -------------------------------------------------------------------
 if _page == "Discover":
     st.subheader("Find new stocks to swing-trade")
@@ -2539,6 +2744,7 @@ if _page == "📡 Scanners":
         if e2.button("Backtest explosive filter", key="_ex_bt_run"):
             trades, summary = _cached_explosive_backtest(tuple(cf_universe), cf_target, ex_min)
             st.json(summary)
+            render_backtest_metrics(summary)
             if not trades.empty:
                 st.dataframe(trades.sort_values("explosive_score", ascending=False).head(100),
                              width="stretch", hide_index=True)
@@ -2558,7 +2764,7 @@ if _page == "📡 Scanners":
     elif _scanner == "⚡ Sudden Move Radar":
         st.markdown("**Sudden Move Radar** — ranks stocks where compression, "
                     "quiet accumulation, relative strength, float/liquidity, "
-                    "catalysts and optional intraday confirmation line up.")
+                    "anomaly pressure, catalysts and optional intraday confirmation line up.")
         c1, c2, c3 = st.columns([1, 1, 1])
         sr_limit = c1.slider("Max names", 5, 100, 30, key="_sr_limit")
         sr_intraday = c2.checkbox("Use intraday confirmation", key="_sr_intraday",
@@ -2574,11 +2780,14 @@ if _page == "📡 Scanners":
         else:
             show_cols = ["ticker", "radar_score", "readiness", "last",
                          "compression", "accumulation", "prebreakout",
-                         "relative_strength", "catalyst", "intraday_confirm",
+                         "relative_strength", "anomaly_score",
+                         "anomaly_volume_z", "anomaly_range_z", "anomaly_turnover_z",
+                         "catalyst", "intraday_confirm",
                          "manip_penalty", "reasons", "risks"]
             st.dataframe(radar[show_cols], width="stretch", hide_index=True)
-            st.caption("High score means setup pressure, not certainty. Use live price/volume "
-                       "confirmation before acting.")
+            st.caption("High score means setup pressure, not certainty. The anomaly columns "
+                       "show how unusual current participation/expansion is versus the stock's "
+                       "own recent history. Use live price/volume confirmation before acting.")
 
         st.markdown("##### Historical check")
         b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
@@ -2590,6 +2799,7 @@ if _page == "📡 Scanners":
             trades, summary = _cached_sudden_backtest(
                 tuple(sr_universe), bt_score, bt_move, bt_horizon)
             st.json(summary)
+            render_backtest_metrics(summary)
             if not trades.empty:
                 st.dataframe(trades.sort_values("radar_score", ascending=False).head(100),
                              width="stretch", hide_index=True)
@@ -2649,27 +2859,35 @@ if _page == "📡 Scanners":
     elif _scanner == "🏛 Institutional Flow":
         st.markdown("**Smart-money tape** — named buyers/sellers from disclosed "
                     "**bulk & block deals**, plus sell-side **brokerage calls**. "
-                    "Disclosed/published data only — and remember to follow long-only "
-                    "accumulators, not prop/market-makers.")
+                    "Now exchange-aware: we store **NSE live + NSE archive + BSE archive** "
+                    "where available. This is still disclosed/public data only, not the "
+                    "full institutional order book.")
         c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
         inst_days = c1.slider("Lookback (days)", 7, 90, 30, key="_inst_days")
         inst_marquee = c2.checkbox(
             "Marquee only", key="_inst_marquee",
             help="Only stocks with BlackRock / Morgan Stanley / JPMorgan / Jefferies / GIC / a big MF on the tape")
-        if c3.button("Fetch EOD deals", help="Pull the end-of-day bulk/block archive market-wide"):
+        if c3.button("Fetch NSE+BSE EOD deals",
+                     help="Pull public end-of-day bulk/block disclosures from both exchanges"):
             from swingdesk.ingest import nse as _nse
-            with st.spinner("Fetching NSE bulk/block deals…"):
-                _nse.ingest_deals(None)
+            with st.spinner("Fetching NSE + BSE bulk/block deals…"):
+                nse_rows = _nse.ingest_deals(None)
+                bse_rows = bse_ingest.ingest_deals(None, days=inst_days)
             _cached_inst_flow.clear()
-            st.success("deals updated")
+            _cached_investor_activity.clear()
+            _cached_deal_coverage.clear()
+            st.success(f"deals updated · NSE {nse_rows} rows · BSE {bse_rows} rows")
         if c4.button("🔴 Pull LIVE now",
                      help="Fetch NSE's INTRADAY large-deals feed right now — deals as "
                           "they're disclosed to the exchange (bounded by SEBI's ~1h lag, "
-                          "not end-of-day)."):
+                          "not end-of-day). BSE currently has archive coverage here; live "
+                          "pull remains NSE-first."):
             from swingdesk.ingest import nse as _nse
             with st.spinner("Pulling live large deals…"):
                 _seen, _new = _nse.ingest_live_deals()
             _cached_inst_flow.clear()
+            _cached_investor_activity.clear()
+            _cached_deal_coverage.clear()
             st.success(f"live feed: {_seen} deals · {len(_new)} new")
 
         # Live auto-refresh: poll the intraday feed while this tab stays open.
@@ -2687,6 +2905,8 @@ if _page == "📡 Scanners":
                 _now = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%H:%M:%S")
                 if _new:
                     _cached_inst_flow.clear()
+                    _cached_investor_activity.clear()
+                    _cached_deal_coverage.clear()
                     st.caption(f"🔴 live · {_now} IST · {len(_new)} new deal(s) — refreshing…")
                     st.rerun(scope="app")
                 else:
@@ -2694,12 +2914,20 @@ if _page == "📡 Scanners":
             _inst_live_tick()
 
         flows = _cached_inst_flow(inst_days, inst_marquee)
+        cov = _cached_deal_coverage(inst_days)
+        if cov.empty:
+            st.caption("No disclosed deal rows stored in this window yet.")
+        else:
+            st.markdown("##### Coverage")
+            st.dataframe(cov, width="stretch", hide_index=True)
+            st.caption("Coverage is still public-tape limited. NSE live feed improves freshness; "
+                       "BSE is currently end-of-day archive coverage here.")
         st.markdown("##### Deal flow (bulk + block)")
         st.caption("**Stock** = the company traded · **Buyers/Sellers** = the named "
-                   "parties on the deal tape (mostly prop/HFT desks — marquee long-only "
-                   "funds rarely cross the bulk-deal threshold; see note below).")
+                   "parties on the deal tape · **Exchanges** = which public exchange "
+                   "archives/feed contributed rows for that stock in this window.")
         if not flows:
-            st.info("No deals stored. Click **Fetch latest deals** above "
+            st.info("No deals stored. Click **Fetch NSE+BSE EOD deals** above "
                     "(or run `swingdesk nse --all-deals`).")
         else:
             def _names(flow, want_buy):
@@ -2713,6 +2941,7 @@ if _page == "📡 Scanners":
                 "Latest deal": f.latest_date or "—",
                 "Net": f.net_side,
                 "₹cr": round(f.net_value / 1e7, 2) if f.net_value else 0.0,
+                "Exchanges": " / ".join(f.exchanges) if f.exchanges else "—",
                 "Buyers": _names(f, True),
                 "Sellers": _names(f, False),
                 "Marquee": " · ".join(f.marquee),
@@ -2723,6 +2952,28 @@ if _page == "📡 Scanners":
                         help="Most recent disclosed bulk/block-deal date for this stock "
                              "in the lookback window. Click the header to sort by date."),
                 })
+
+        st.markdown("##### Investor activity")
+        st.caption("Grouped by named client across all disclosed deals in the selected "
+                   "window. This is the closest public read we currently have on who keeps "
+                   "showing up, but it is not a complete holdings register.")
+        i1, i2 = st.columns([1, 1])
+        investor_side = i1.radio("Investor net side", ["BUY", "SELL"], horizontal=True,
+                                 key="_inst_investor_side")
+        investor_rows = _cached_investor_activity(inst_days, investor_side)
+        if not investor_rows:
+            st.caption("No named investor activity matched this filter.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "Investor": x.client.title(),
+                "Net": x.net_side,
+                "Net ₹cr": round(abs(x.net_value) / 1e7, 2),
+                "Deals": x.n_deals,
+                "Stocks": ", ".join(x.tickers[:4]) + (" …" if len(x.tickers) > 4 else ""),
+                "Exchanges": " / ".join(x.exchanges) if x.exchanges else "—",
+                "Marquee": x.marquee or "",
+                "Latest deal": x.latest_date or "—",
+            } for x in investor_rows]), width="stretch", hide_index=True)
 
         st.markdown("##### 🔻 Heaviest institutional selling — with a possible reason")
         st.caption("Net-**sell** stocks from the disclosed bulk/block tape, largest "
@@ -4963,3 +5214,5 @@ if _page == "📟 Paper Trader":
                                      "n_open", "opened", "closed", "halted", "note"]
                          if c in log.columns]
             st.dataframe(log[show_cols].iloc[::-1], hide_index=True, width="stretch")
+
+_render_footer()

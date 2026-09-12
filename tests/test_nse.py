@@ -68,10 +68,11 @@ def test_delivery_and_deals_storage_roundtrip(tmp_db):
     assert d["deliv_pct"].iloc[-1] == 20.0  # ordered by date ascending
 
     storage.upsert_deals([
-        {"deal_type": "bulk", "date": "2026-06-09", "ticker": "ABC.NS",
+        {"exchange": "NSE", "deal_type": "bulk", "date": "2026-06-09", "ticker": "ABC.NS",
          "security": "ABC Ltd", "client": "OP LLP", "side": "BUY",
          "qty": 1e5, "price": 100.0},
     ])
     deals = storage.load_deals("ABC.NS")
     assert len(deals) == 1
     assert deals["client"].iloc[0] == "OP LLP"
+    assert deals["exchange"].iloc[0] == "NSE"

@@ -88,3 +88,20 @@ def test_extract_bearish_wins_over_soft_bull_word():
     out = inst.extract_brokerage_action(
         "Motilal Oswal Cautious on Nykaa valuations; maintains Neutral despite upside")
     assert out is not None and out[2] == "bearish"
+
+
+def test_investor_activity_groups_clients(monkeypatch):
+    deals = pd.DataFrame([
+        {"exchange": "NSE", "date": "2026-06-20", "ticker": "WABAG.NS", "security": "VA Tech Wabag",
+         "client": "MORGAN STANLEY ASIA", "side": "BUY", "qty": 100000, "price": 1500},
+        {"exchange": "BSE", "date": "2026-06-21", "ticker": "WABAG.NS", "security": "VA Tech Wabag",
+         "client": "MORGAN STANLEY ASIA", "side": "SELL", "qty": 20000, "price": 1510},
+        {"exchange": "NSE", "date": "2026-06-21", "ticker": "AAA.NS", "security": "Aaa",
+         "client": "RANDOM TRADER", "side": "SELL", "qty": 1000, "price": 100},
+    ])
+    monkeypatch.setattr(inst, "load_deals", lambda days=None: deals)
+    rows = inst.investor_activity(days=30)
+    assert rows[0].client == "MORGAN STANLEY ASIA"
+    assert rows[0].net_side == "BUY"
+    assert "MORGAN STANLEY" in (rows[0].marquee or "")
+    assert rows[0].exchanges == ["BSE", "NSE"]

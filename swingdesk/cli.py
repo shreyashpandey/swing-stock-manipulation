@@ -572,6 +572,7 @@ def cmd_fundamentals(args):
 
 def cmd_nse(args):
     """Pull NSE delivery % + bulk/block deals for the universe (manipulation section)."""
+    from swingdesk.ingest import bse as bse_ingest
     init_db()
     seed_watchlist_if_empty(DEFAULT_WATCHLIST)
     universe = combined_universe(include_smallcaps=args.extended,
@@ -584,6 +585,7 @@ def cmd_nse(args):
         # institutional-flow scanner sees who's buying anything, anywhere.
         nse_ingest.ingest_delivery(universe, days=args.days)
         nse_ingest.ingest_deals(None)
+        bse_ingest.ingest_deals(None, days=args.days)
     else:
         nse_ingest.ingest(universe, days=args.days)
 
@@ -627,8 +629,21 @@ def cmd_institutional(args):
         mq = f"  [bold cyan]{' · '.join(f.marquee)}[/bold cyan]" if f.marquee else ""
         cr = f" ₹{f.net_value / 1e7:,.1f}cr" if f.net_value else ""
         console.print(f"  {f.ticker:>14}  {side}{cr}  deals={f.n_deals}{mq}")
+        if f.exchanges:
+            console.print(f"        [dim]exchanges: {' / '.join(f.exchanges)}[/dim]")
         for name, cside in f.clients[:4]:
             console.print(f"        [dim]{cside:<4} {name[:60]}[/dim]")
+
+    investors = inst.investor_activity(days=args.days, limit=args.limit)
+    if investors:
+        console.rule("[bold]Top named investors on the disclosed tape")
+        for inv in investors[: min(10, len(investors))]:
+            side = ("[green]NET BUY[/green]" if inv.net_side == "BUY" else
+                    "[red]NET SELL[/red]" if inv.net_side == "SELL" else "FLAT")
+            mq = f"  [bold cyan]{inv.marquee}[/bold cyan]" if inv.marquee else ""
+            tickers = ", ".join(inv.tickers[:3]) + ("…" if len(inv.tickers) > 3 else "")
+            console.print(f"  {inv.client[:40]:<40} {side}  ₹{abs(inv.net_value) / 1e7:,.1f}cr{mq}")
+            console.print(f"        [dim]stocks: {tickers or '—'} · exchanges: {' / '.join(inv.exchanges) or '—'}[/dim]")
 
     actions = inst.brokerage_actions(days=args.days, limit=args.limit)
     if actions:
@@ -760,7 +775,8 @@ def cmd_sudden_radar(args):
         console.print("[yellow]no radar rows — fetch prices/fundamentals first[/yellow]")
         return
     cols = ["ticker", "radar_score", "readiness", "last", "compression",
-            "accumulation", "prebreakout", "relative_strength", "catalyst",
+            "accumulation", "prebreakout", "relative_strength", "anomaly_score",
+            "anomaly_volume_z", "anomaly_range_z", "anomaly_turnover_z", "catalyst",
             "intraday_confirm", "manip_penalty", "reasons", "risks"]
     console.rule("[bold]Sudden Move Radar — setup pressure, not a guarantee")
     console.print(df[cols].to_string(index=False))

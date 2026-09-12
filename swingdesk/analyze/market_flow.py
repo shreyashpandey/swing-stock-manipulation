@@ -399,6 +399,10 @@ def explosive_move_backtest(tickers: list[str], *, target_move_pct: float = 10.0
     trades = pd.DataFrame(rows, columns=EXPLOSIVE_BT_COLS)
     if trades.empty:
         return trades, {"n": 0, "hit_rate_pct": 0.0, "avg_next_high_ret_pct": 0.0}
+    rank_metrics = sudden_move.ranking_metrics(
+        trades, score_col="explosive_score", hit_col="hit",
+        return_col="next_close_ret_pct",
+    )
     summary = {
         "n": int(len(trades)),
         "target_move_pct": target_move_pct,
@@ -408,6 +412,7 @@ def explosive_move_backtest(tickers: list[str], *, target_move_pct: float = 10.0
         "avg_next_close_ret_pct": round(float(trades["next_close_ret_pct"].mean()), 2),
         "median_explosive_score": round(float(trades["explosive_score"].median()), 1),
     }
+    summary.update(rank_metrics)
     return trades, summary
 
 

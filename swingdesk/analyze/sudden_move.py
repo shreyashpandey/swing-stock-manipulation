@@ -26,6 +26,7 @@ MIN_BARS = 90
 RADAR_COLS = [
     "ticker", "radar_score", "readiness", "directional_bias", "compression",
     "accumulation", "prebreakout", "relative_strength", "float_spark",
+    "anomaly_score", "anomaly_volume_z", "anomaly_range_z", "anomaly_turnover_z",
     "catalyst", "global_score", "intraday_confirm", "manip_penalty",
     "last", "range_20d_pct", "near_20d_high_pct", "volume_mult",
     "adv_value_cr", "float_turnover_pct", "reasons", "risks",
@@ -43,6 +44,10 @@ class RadarRow:
     prebreakout: float
     relative_strength: float
     float_spark: float
+    anomaly_score: float
+    anomaly_volume_z: float
+    anomaly_range_z: float
+    anomaly_turnover_z: float
     catalyst: float
     global_score: float
     intraday_confirm: float
@@ -73,6 +78,25 @@ def _ret(close: pd.Series, n: int) -> float | None:
     if len(close) <= n or close.iloc[-1 - n] <= 0:
         return None
     return float(close.iloc[-1] / close.iloc[-1 - n] - 1)
+
+
+def _robust_z(value: float, hist: pd.Series) -> float:
+    hist = pd.to_numeric(hist, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(hist) < 20 or not np.isfinite(value):
+        return 0.0
+    med = float(hist.median())
+    mad = float((hist - med).abs().median())
+    if mad <= 1e-12:
+        std = float(hist.std())
+        if std <= 1e-12:
+            # A constant baseline has no finite z-score. Treat a material
+            # departure as saturated, ignoring floating-point noise.
+            delta = value - med
+            tolerance = max(1e-12, abs(med) * 1e-6)
+            return 0.0 if abs(delta) <= tolerance else float(np.sign(delta) * 4.0)
+        return float(np.clip((value - hist.mean()) / std, -4.0, 4.0))
+    z = 0.6745 * (value - med) / mad
+    return float(np.clip(z, -4.0, 4.0))
 
 
 def _compression(df: pd.DataFrame) -> tuple[float, float | None]:
@@ -147,6 +171,39 @@ def _float_spark(df: pd.DataFrame, fund: dict | None) -> tuple[float, float | No
         round(float_turn, 2) if mm.avg_float_turnover_pct is not None else None)
 
 
+def _anomaly_layer(df: pd.DataFrame, fund: dict | None) -> tuple[float, float, float, float, list[str]]:
+    """Explainable anomaly layer: unusual participation / expansion / turnover."""
+    close = df["close"].astype(float)
+    vol = df["volume"].astype(float)
+    rets = close.pct_change().abs()
+    range_pct = (df["high"].astype(float) / df["low"].astype(float) - 1).replace([np.inf, -np.inf], np.nan)
+    vol_z = _robust_z(float(vol.iloc[-1]), vol.iloc[-61:-1])
+    range_z = _robust_z(float(range_pct.iloc[-1]), range_pct.iloc[-61:-1])
+
+    turnover_z = 0.0
+    mm = market_metrics.compute(df, fund or {}, allow_derive=True)
+    if mm is not None and mm.today_value_spike_mult is not None:
+        traded_value = (df["close"].astype(float) * vol).replace([np.inf, -np.inf], np.nan)
+        hist_value = traded_value.iloc[-61:-1]
+        turnover_z = _robust_z(float(traded_value.iloc[-1]), hist_value)
+    ret_z = _robust_z(float(rets.iloc[-1]) if len(rets) else 0.0, rets.iloc[-61:-1])
+
+    score = _clip(
+        0.34 * max(vol_z, 0.0) * 20.0 +
+        0.26 * max(range_z, 0.0) * 20.0 +
+        0.24 * max(turnover_z, 0.0) * 20.0 +
+        0.16 * max(ret_z, 0.0) * 20.0
+    )
+    reasons: list[str] = []
+    if vol_z >= 1.5:
+        reasons.append(f"volume anomaly z={vol_z:.1f}")
+    if range_z >= 1.5:
+        reasons.append(f"range anomaly z={range_z:.1f}")
+    if turnover_z >= 1.5:
+        reasons.append(f"value-turnover anomaly z={turnover_z:.1f}")
+    return round(score, 1), round(vol_z, 2), round(range_z, 2), round(turnover_z, 2), reasons
+
+
 def _sentiment_pressure(ticker: str, days: int = 3) -> tuple[float, list[str]]:
     df = recent_sentiment_for_ticker(ticker, days=days)
     if df.empty:
@@ -206,6 +263,7 @@ def score_frame(ticker: str, df: pd.DataFrame, *, fund: dict | None = None,
     pre, near_high = _prebreakout(df)
     rel = _relative_strength(df, benchmark)
     spark, adv_cr, float_turn = _float_spark(df, fund)
+    anomaly, vol_z, rng_z, turn_z, anomaly_reasons = _anomaly_layer(df, fund)
 
     catalyst_raw = sentiment_score + global_score
     catalyst = _clip((catalyst_raw + 8.0) / 32.0 * 100)
@@ -234,6 +292,7 @@ def score_frame(ticker: str, df: pd.DataFrame, *, fund: dict | None = None,
         0.18 * pre +
         0.14 * rel +
         0.12 * spark +
+        0.12 * anomaly +
         0.11 * catalyst +
         intraday -
         manip_penalty
@@ -252,6 +311,8 @@ def score_frame(ticker: str, df: pd.DataFrame, *, fund: dict | None = None,
         reasons.append("relative strength")
     if spark >= 65:
         reasons.append("float/liquidity can move")
+    for r in anomaly_reasons[:2]:
+        reasons.append(r)
     for r in (sentiment_reasons or [])[:2]:
         reasons.append(f"news: {r}")
     for r in (global_reasons or [])[:2]:
@@ -262,13 +323,79 @@ def score_frame(ticker: str, df: pd.DataFrame, *, fund: dict | None = None,
         ticker=ticker, radar_score=score, readiness=readiness,
         directional_bias="upside" if score >= 45 else "neutral",
         compression=comp, accumulation=accum, prebreakout=pre,
-        relative_strength=rel, float_spark=spark, catalyst=round(catalyst, 1),
+        relative_strength=rel, float_spark=spark,
+        anomaly_score=anomaly, anomaly_volume_z=vol_z,
+        anomaly_range_z=rng_z, anomaly_turnover_z=turn_z,
+        catalyst=round(catalyst, 1),
         global_score=global_score, intraday_confirm=intraday,
         manip_penalty=manip_penalty, last=round(float(df["close"].iloc[-1]), 2),
         range_20d_pct=range_pct, near_20d_high_pct=near_high,
         volume_mult=volume_mult, adv_value_cr=adv_cr,
         float_turnover_pct=float_turn, reasons=reasons, risks=risks,
     )
+
+
+def _binary_auc(y_true: np.ndarray, scores: np.ndarray) -> float | None:
+    y = np.asarray(y_true, dtype=float)
+    s = np.asarray(scores, dtype=float)
+    pos = int((y == 1).sum())
+    neg = int((y == 0).sum())
+    if pos == 0 or neg == 0:
+        return None
+    ranks = pd.Series(s).rank(method="average").to_numpy()
+    pos_ranks = float(ranks[y == 1].sum())
+    return float((pos_ranks - pos * (pos + 1) / 2) / (pos * neg))
+
+
+def _average_precision(y_true: np.ndarray, scores: np.ndarray) -> float | None:
+    y = np.asarray(y_true, dtype=int)
+    s = np.asarray(scores, dtype=float)
+    pos = int((y == 1).sum())
+    if pos == 0:
+        return None
+    order = np.argsort(-s)
+    y_sorted = y[order]
+    # Evaluate at distinct score thresholds, including all ties together.
+    boundaries = np.r_[np.flatnonzero(np.diff(s[order])), len(s) - 1]
+    cumulative_hits = np.cumsum(y_sorted)[boundaries]
+    precision = cumulative_hits / (boundaries + 1)
+    recall_increments = np.diff(np.r_[0, cumulative_hits]) / pos
+    return float(np.sum(precision * recall_increments))
+
+
+def ranking_metrics(trades: pd.DataFrame, *, score_col: str, hit_col: str,
+                    return_col: str, ks: tuple[int, ...] = (5, 10)) -> dict:
+    """Ranking-focused evaluation for scanners: precision/recall/returns per day."""
+    if not ks or any(k <= 0 for k in ks):
+        raise ValueError("ks must contain positive selection counts")
+    out = {"roc_auc": None, "pr_auc": None,
+           "evaluation_scope": "Candidates passing the scanner threshold; PR metric is average precision.",
+           "portfolio_metrics_reason": "Unavailable: signal outcomes do not model daily equity, overlapping positions or idle cash."}
+    for k in ks:
+        out.update({f"precision_at_{k}": None, f"recall_at_{k}": None,
+                    f"avg_return_top_{k}_pct": None, f"sharpe_top_{k}": None,
+                    f"max_drawdown_top_{k}_pct": None})
+    if trades.empty:
+        return out
+    df = trades.copy()
+    y = df[hit_col].astype(int).to_numpy()
+    scores = df[score_col].astype(float).to_numpy()
+    out.update(roc_auc=_binary_auc(y, scores), pr_auc=_average_precision(y, scores))
+    total_hits = int(df[hit_col].astype(bool).sum())
+    for k in ks:
+        picks = (df.sort_values([score_col], ascending=False)
+                   .groupby("date", group_keys=False)
+                   .head(k))
+        if picks.empty:
+            out[f"precision_at_{k}"] = None
+            out[f"recall_at_{k}"] = None
+            out[f"avg_return_top_{k}_pct"] = None
+            continue
+        hits = int(picks[hit_col].astype(bool).sum())
+        out[f"precision_at_{k}"] = float(hits / len(picks)) if len(picks) else None
+        out[f"recall_at_{k}"] = float(hits / total_hits) if total_hits else None
+        out[f"avg_return_top_{k}_pct"] = float(picks[return_col].mean())
+    return out
 
 
 def scan(tickers: list[str] | None = None, *, include_intraday: bool = False,
@@ -335,6 +462,10 @@ def backtest(tickers: list[str], *, min_score: float = 70.0, move_threshold_pct:
             "n": 0, "hit_rate_high": 0.0, "hit_rate_close": 0.0,
             "avg_next_high_ret_pct": 0.0, "avg_next_close_ret_pct": 0.0,
         }
+    metrics = ranking_metrics(
+        trades, score_col="radar_score", hit_col="hit_high",
+        return_col="next_close_ret_pct",
+    )
     summary = {
         "n": int(len(trades)),
         "hit_rate_high": round(float(trades["hit_high"].mean() * 100), 1),
@@ -343,5 +474,5 @@ def backtest(tickers: list[str], *, min_score: float = 70.0, move_threshold_pct:
         "avg_next_close_ret_pct": round(float(trades["next_close_ret_pct"].mean()), 2),
         "median_score": round(float(trades["radar_score"].median()), 1),
     }
+    summary.update(metrics)
     return trades, summary
-

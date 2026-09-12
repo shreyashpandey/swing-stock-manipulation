@@ -1,5 +1,10 @@
 # SwingDesk — Product Blueprint
 
+Review notice, 2026-09-11: the [Plan risk review](PLAN_RISK_REVIEW.md) and revised
+[Business implementation plan](BUSINESS_IMPLEMENTATION_PLAN.md) govern launch
+decisions. Competitor status below is a historical comparison, not verified legal
+precedent. Analytics, AI and disclaimer wording do not establish an exemption.
+
 > Reference document for turning the local SwingDesk app into a sellable consumer product.
 > Status: planning. Last updated: 2026-06-19.
 > Read this top-to-bottom once; after that use it as the map for "how we operate."
@@ -24,13 +29,15 @@ collapse into **5 clean sections**: Home · Discover · Scanners · Portfolio ·
 | **smallcase** | Platform hosting curated stock *baskets* | **Tech platform** — baskets built by registered RA/RIA/PMS managers; smallcase itself is rails | One-click via 15+ linked brokers; user owns stocks in own demat | The *platform* can be unregistered **if** the advice comes from a registered party. Separation of "rails" vs "advice." |
 | **Univest** | Stock advisory + broker | **Registered RA (INH000013776) + IA (INA000017639)** | One-click, GTT orders | Full Path A: AI screens 5,000 stocks → registered analysts approve → calls with entry/SL/target. Requires registration. |
 | **Liquide** | AI research assistant ("LiMo") + ideas | **Registered RA** | Via smallcase rails + brokers | Even the "AI gives Buy/Sell/Hold" model is done as a *registered RA*. AI doesn't exempt you. |
-| **Tickertape** *(smallcase-owned)* | Pure analytics / screener / scores | **No registration — it's a tool** | None (read-only) | **★ This is our model.** Data, scores, screeners, portfolio tracking. Never says "buy." Sells subscriptions. |
+| **Tickertape** *(historical comparison)* | Analytics / screener / scores | **Not verified in this review; not precedent for SwingDesk** | Historical product snapshot | Research-workflow inspiration; assess our actual outputs separately. |
 
-**The decisive insight:** every app that gives *recommendations* is a registered RA/RIA. The only way to
-sell **without** registration is to be the **analytics-tool layer (Tickertape)**, not the advice layer.
-So:
+**Working direction:** build user-directed analytical software. Whether the actual
+service requires registration depends on its substance and applicable exemptions,
+not a competitor comparison. Security-specific research can be regulated without
+personalization. The operating-model options are:
 
-- **Phase 1 (now → launch): be Tickertape.** Analytics workbench, Path B, no registration.
+- **Phase 1 (now → launch): bounded analytics workbench.** Validate the intended
+  unregistered scope through substantive review before exposing it to customers.
 - **Phase 2 (optional, later): add an advice layer** either by (a) getting RA-registered yourself, or
   (b) becoming/partnering with a **smallcase manager** so the registered party supplies the calls and
   we stay the tech rails. Design the app now so this can bolt on later without a rewrite.
@@ -43,7 +50,8 @@ So:
 
 ## 2. Product principles — the "tool, not advice" rules (baked into every screen)
 
-A feature stays a sellable tool when it passes all three tests. Fail one → it's regulated advice.
+These questions guide product design; they are not a legal test or an exemption.
+Both passing and failing cases require assessment of the actual service.
 
 | Test | ✅ Tool (we do this) | 🛑 Advice (we never do this) |
 |---|---|---|
@@ -134,7 +142,8 @@ Account & Plan · Settings (data sources, coverage) · Legal & Disclaimers.
 
 ## 4. Compliance & disclaimers — where every notice lives
 
-Five layers. Disclaimers are not decoration — they are the legal boundary that keeps us on Path B.
+Five disclosure layers support transparency. They do not make regulated activity
+unregulated or cure contradictory recommendations elsewhere in the product.
 
 1. **Onboarding gate (first launch / signup) — BLOCKING.**
    Modal the user must actively accept before entering. Store `disclaimer_accepted_at` + version
@@ -349,7 +358,7 @@ This is what makes margins work and the app fast.
 | Phase | Goal | Key work |
 |---|---|---|
 | **0. De-risk (1–2 wk)** | Don't build on sand | Confirm Path B with a SEBI lawyer; license a data feed for trial; lock copy/disclaimer language |
-| **1. Reframe (1–2 wk)** | Make it legally a tool | Kill BUY/WAIT/AVOID → setup-strength; "signals"→screener; "invest fresh money"→calculator; add 5 disclaimer layers |
+| **1. Reframe (estimate superseded by reviewed plan)** | Bound and review the actual public service | Remove prescriptive behavior; define public schemas and review their substance; align labels and disclosures |
 | **2. Re-IA (1–2 wk)** | Kill the confusion | Implement 5-section nav + mapping (§3); add Home dashboard |
 | **3. Multi-tenant MVP (4–8 wk)** | First paying users | Postgres + `user_id`; auth; plan-gating (§6); Razorpay; batch-compute |
 | **4. Productize (8–12 wk)** | Real SaaS | FastAPI + React; Celery/Redis batch engine; onboarding; licensed feed at scale |

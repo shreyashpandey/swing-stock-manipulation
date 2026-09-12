@@ -5,7 +5,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True so .env is the single source of truth — otherwise a stale
+# ANTHROPIC_API_KEY exported in the launching shell silently shadows .env and the
+# Claude calls (sentiment / thesis) fail auth even when .env is correct.
+load_dotenv(override=True)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
