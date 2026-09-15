@@ -89,39 +89,35 @@ def test_cost_estimate_frontloading_cuts_timing_risk():
 
 
 # --------------------------------------------------------------------------- #
-# End-to-end against the local DB (skips cleanly if no priced names)
+# End-to-end against isolated synthetic data.
 # --------------------------------------------------------------------------- #
-def _a_priced_ticker():
-    from swingdesk.storage import connect
-    try:
-        with connect() as con:
-            df = pd.read_sql_query("SELECT DISTINCT ticker FROM prices LIMIT 1", con)
-        return df["ticker"].iloc[0] if not df.empty else None
-    except Exception:
-        return None
+@pytest.fixture
+def priced_ticker(tmp_db, synth_ohlcv):
+    from swingdesk import storage
+    storage.upsert_prices("TEST.NS", synth_ohlcv)
+    return "TEST.NS"
 
 
-def test_execution_plan_schedule_sums_to_order():
-    t = _a_priced_ticker()
-    if t is None:
-        pytest.skip("no priced tickers in local DB")
-    plan = ex.execution_plan(t, "buy", qty=500, algo="vwap", bucket_minutes=60)
-    if plan is None:
-        pytest.skip(f"no spot for {t}")
+def test_execution_plan_schedule_sums_to_order(priced_ticker):
+    plan = ex.execution_plan(priced_ticker, "buy", qty=500, algo="vwap", bucket_minutes=60)
+    assert plan is not None
     assert plan.schedule["shares"].sum() == plan.qty
     assert plan.qty == 500
     assert plan.arrival_price > 0
     assert pytest.approx(plan.schedule["cum_pct"].iloc[-1], abs=0.5) == 100.0
 
 
-def test_execution_plan_notional_and_algos_run():
-    t = _a_priced_ticker()
-    if t is None:
-        pytest.skip("no priced tickers in local DB")
+def test_execution_plan_notional_and_algos_run(priced_ticker):
     for algo in ex.ALGOS:
-        plan = ex.execution_plan(t, "sell", notional=200000, algo=algo, bucket_minutes=60)
-        if plan is None:
-            pytest.skip(f"no spot for {t}")
+        plan = ex.execution_plan(priced_ticker, "sell", notional=200000, algo=algo, bucket_minutes=60)
+        assert plan is not None
         assert plan.qty > 0
         assert not plan.schedule.empty
         assert np.isfinite(plan.est_cost_bps)
+
+
+@pytest.mark.parametrize("spot", [None, np.nan, np.inf, -np.inf, 0, -1])
+@pytest.mark.parametrize("order", [{"qty": 500}, {"notional": 200000}])
+def test_execution_rejects_invalid_latest_price(monkeypatch, spot, order):
+    monkeypatch.setattr(ex, "load_prices", lambda *a, **k: pd.DataFrame({"close": [100, spot]}))
+    assert ex.execution_plan("TEST.NS", **order) is None

@@ -277,8 +277,11 @@ def execution_plan(ticker: str, side: str = "buy", *, qty: int | None = None,
     px = load_prices(ticker, days=10)
     if px is None or px.empty:
         return None
-    spot = float(px["close"].iloc[-1])
-    if spot <= 0:
+    latest_close = px["close"].iloc[-1]
+    if pd.isna(latest_close):
+        return None
+    spot = float(latest_close)
+    if not np.isfinite(spot) or spot <= 0:
         return None
 
     if qty is None:

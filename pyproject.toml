@@ -21,5 +21,8 @@ dependencies = [
     "scikit-learn>=1.4",
 ]
 
+[project.optional-dependencies]
+backend = ["pydantic==2.13.4"]
+
 [tool.setuptools.packages.find]
-include = ["swingdesk*"]
+include = ["swingdesk*", "backend*"]

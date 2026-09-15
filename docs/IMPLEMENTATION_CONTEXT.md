@@ -1,5 +1,19 @@
 # SwingDesk Implementation Context
 
+## Implementation increment: 2026-09-15
+
+The reviewed baseline is committed as `5fcebf4`. B02 now has typed observation
+contracts and a pure allowlisted radar-row projection in `backend/swingdesk_api/`,
+with synthetic regression coverage. See [backend notes](../backend/README.md).
+No new HTTP routes, accounts, production database or customer web UI are exposed.
+Public output review remains pending; this is the contract foundation only.
+
+Validation for this increment: 547 passed, 1 skipped. The contract-only checks
+also pass (17 tests), including generated schema consistency. Two execution tests
+previously used live local prices; they now use isolated synthetic data, and the
+execution planner rejects missing/non-finite arrival prices rather than producing
+NaN plans or failing during quantity conversion.
+
 Last reviewed: 2026-07-07
 
 ## Latest implementation note: 2026-09-11

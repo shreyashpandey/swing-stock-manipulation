@@ -1,0 +1,225 @@
+{
+  "$defs": {
+    "Instrument": {
+      "additionalProperties": false,
+      "properties": {
+        "exchange": {
+          "enum": [
+            "NSE",
+            "BSE"
+          ],
+          "title": "Exchange",
+          "type": "string"
+        },
+        "instrument_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "title": "Instrument Id",
+          "type": "string"
+        },
+        "symbol": {
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^[A-Z0-9&^_.=-]+$",
+          "title": "Symbol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument_id",
+        "symbol",
+        "exchange"
+      ],
+      "title": "Instrument",
+      "type": "object"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "properties": {
+        "metric": {
+          "enum": [
+            "close",
+            "range_20_observations_pct",
+            "volume_multiple",
+            "average_daily_value_cr"
+          ],
+          "title": "Metric",
+          "type": "string"
+        },
+        "missing_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "not_supplied",
+                "non_finite"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Missing Reason"
+        },
+        "status": {
+          "enum": [
+            "available",
+            "missing"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "unit": {
+          "enum": [
+            "INR",
+            "percent",
+            "multiple",
+            "INR_crore"
+          ],
+          "title": "Unit",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "metric",
+        "value",
+        "unit",
+        "status"
+      ],
+      "title": "Observation",
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adjustment_basis": {
+          "enum": [
+            "raw",
+            "adjusted",
+            "unknown"
+          ],
+          "title": "Adjustment Basis",
+          "type": "string"
+        },
+        "available_at": {
+          "format": "date-time",
+          "title": "Available At",
+          "type": "string"
+        },
+        "batch_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "title": "Batch Id",
+          "type": "string"
+        },
+        "coverage": {
+          "enum": [
+            "complete",
+            "partial",
+            "unknown"
+          ],
+          "title": "Coverage",
+          "type": "string"
+        },
+        "formula_version": {
+          "const": "legacy-radar-observations-v1",
+          "default": "legacy-radar-observations-v1",
+          "title": "Formula Version",
+          "type": "string"
+        },
+        "freshness": {
+          "enum": [
+            "current",
+            "stale",
+            "unknown"
+          ],
+          "title": "Freshness",
+          "type": "string"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "session_date": {
+          "format": "date",
+          "title": "Session Date",
+          "type": "string"
+        },
+        "source_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "batch_id",
+        "source_id",
+        "session_date",
+        "observed_at",
+        "available_at",
+        "coverage",
+        "freshness",
+        "adjustment_basis"
+      ],
+      "title": "Provenance",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "instrument": {
+      "$ref": "#/$defs/Instrument"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/$defs/Observation"
+      },
+      "maxItems": 4,
+      "minItems": 4,
+      "title": "Observations",
+      "type": "array"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "ready",
+        "limited"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "instrument",
+    "provenance",
+    "observations",
+    "status"
+  ],
+  "title": "ScannerEvidence",
+  "type": "object"
+}

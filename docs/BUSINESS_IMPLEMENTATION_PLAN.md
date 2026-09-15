@@ -8,6 +8,12 @@ the earlier 35-day estimate and 12-week paid-launch assumption. Public deploymen
 remains conditional on the review's release blockers; documentation changes do
 not resolve the code findings.
 
+Implementation update, 2026-09-15: the recorded baseline defects have been fixed
+and the baseline passed 519 tests. B02 has started with versioned observation
+contracts, a strict field projection and synthetic regression tests in `backend/`.
+See [backend implementation notes](../backend/README.md). Substantive output
+review, HTTP routes, managed identity and PostgreSQL are not yet delivered.
+
 This is the consolidated plan for turning the current local app into a paid product.
 It resolves competing roadmap options for the first release. Existing documents
 remain supporting context; delivery notes and code establish what actually exists.
@@ -62,9 +68,8 @@ Existing `research_items` are keyed by kind/name with no user ownership. Existin
 settings and portfolio tables are also local-user constructs. Do not expose them
 through an authenticated public API without introducing ownership boundaries.
 
-The previous test run recorded two independent failures: a date-sensitive global
-news test and a range-anomaly test. Resolve them and establish a clean baseline
-before extracting public analytics contracts.
+The previously recorded date-sensitive global news and range-anomaly test failures
+are fixed. The clean baseline is recorded in `CURRENT_IMPLEMENTATION_REVIEW.md`.
 
 ## 3. First paid beta scope
 
